@@ -2,6 +2,13 @@
 import geni.portal as portal
 import geni.rspec.pg as rspec
 import geni.rspec.igext as IG
+import geni.rspec.emulab.pnext as PN
+import geni.rspec.emulab.emuext
+import geni.urn as URN
+import hashlib
+import os
+import socket
+import struct
 
 # ======== GLOBAL CONSTANTS ========
 class GLOBALS(object):
@@ -107,20 +114,10 @@ rflink_fake = request.RFLink("rflink_fake")
 rflink_fake.addInterface(enb_fake_ue_rf)
 rflink_fake.addInterface(ue_enb_fake_rf)
 
-# Create S1 links if shared VLAN is not specified
+# Create shared VLAN if specified
 if params.shared_vlan:
     connect_shared_vlan(enb1, params.shared_vlan, "192.168.1.3")
     # connect_shared_vlan(enb_fake, params.shared_vlan, "192.168.1.5")
-else:
-    s1_link = request.LAN("s1_lan")
-    s1_link.addInterface(enb1_s1_if)
-    s1_link.link_multiplexing = True
-    s1_link.vlan_tagging = True
-
-    fake_s1_link = request.LAN("fake_s1_lan")
-    fake_s1_link.addInterface(enb_fake_s1_if)
-    fake_s1_link.link_multiplexing = True
-    fake_s1_link.vlan_tagging = True
 
 # ======== TOUR INFORMATION ========
 tour = IG.Tour()
