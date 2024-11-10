@@ -6,8 +6,8 @@ import geni.rspec.igext as IG
 # ======== GLOBAL CONSTANTS ========
 class GLOBALS(object):
     BIN_PATH = "/local/repository/bin"
-    DEPLOY_SRS = GLOBALS.BIN_PATH + "/deploy-srs.sh"
-    TUNE_CPU = GLOBALS.BIN_PATH + "/tune-cpu.sh"
+    DEPLOY_SRS = BIN_PATH + "/deploy-srs.sh"
+    TUNE_CPU = BIN_PATH + "/tune-cpu.sh"
     NUC_HWTYPE = "nuc5300"
     SRSLTE_IMG = "urn:publicid:IDN+emulab.net+image+PowderProfiles:U18LL-SRSLTE"
 
