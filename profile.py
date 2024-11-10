@@ -299,7 +299,7 @@ def create_interface(node, iface_name, ip_address=None, vlan_name=None):
         iface.addAddress(rspec.IPv4Address(ip_address, "255.255.255.0"))
     if vlan_name:
         iface.vlan_name = vlan_name
-        print(f"Interface {iface_name} connected to shared VLAN: {vlan_name}")
+        # print(f"Interface {iface_name} connected to shared VLAN: {vlan_name}")
     return iface
 
 # ======== MAIN EXPERIMENT SETUP ========
