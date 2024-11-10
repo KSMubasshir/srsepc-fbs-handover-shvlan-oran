@@ -276,7 +276,7 @@ def add_services(node, role):
     """
     node.addService(rspec.Execute(shell="bash", command=GLOBALS.DEPLOY_SRS))
     node.addService(rspec.Execute(shell="bash", command=GLOBALS.TUNE_CPU))
-    print(f"Added services to {role}")
+    # print(f"Added services to {role}")
 
 def create_node(name, component_id, role):
     """
