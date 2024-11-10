@@ -3,14 +3,17 @@ import os
 import geni.portal as portal
 import geni.rspec.pg as rspec
 import geni.rspec.igext as IG
-import geni.rspec.emulab.pnext as PN
-import geni.rspec.emulab.emuext
-import geni.urn as URN
-import hashlib
-import os
-import socket
-import struct
 
+# ======== GLOBAL CONSTANTS ========
+class GLOBALS(object):
+    BIN_PATH = "/local/repository/bin"
+    DEPLOY_SRS = os.path.join(GLOBALS.BIN_PATH, "deploy-srs.sh")
+    TUNE_CPU = os.path.join(GLOBALS.BIN_PATH, "tune-cpu.sh")
+    NUC_HWTYPE = "nuc5300"
+    UBUNTU_1804_IMG = "urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU18-64-STD"
+    SRSLTE_IMG = "urn:publicid:IDN+emulab.net+image+PowderProfiles:U18LL-SRSLTE"
+
+# ======== EXPERIMENT DESCRIPTION ========
 tourDescription = """
 ### srsRAN S1 Handover w/ Open5GS
 
@@ -44,8 +47,70 @@ The following resources will be allocated:
     * 1 or 2, depending on "Number of UEs" parameter: `rue1`, `rue2`
   * Intel NUC5300/B210 w/ srsLTE eNB/EPC (`enb1`)
 """
-
 tourInstructions = """
+
+### Prerequisites: O-RAN Setup
+
+You should have already started up an O-RAN experiment connected to
+the same shared VLAN you specified during the "parameterize" step.
+Make sure it is up and fully deployed first - see the instructions
+included in that profile.  However, DO NOT start the srsLTE components
+or `kpimon` xApp as directed in those instructions.
+
+Make note of the `e2term-sctp` service's IP address in the O-RAN
+experiment.  To do that, open an SSH session to `node-0` in that
+experiment and run:
+
+```
+# Extract `e2term-sctp` IP address
+kubectl get svc -n ricplt --field-selector metadata.name=service-ricplt-e2term-sctp-alpha -o jsonpath='{.items[0].spec.clusterIP}'
+```
+
+You will need this address when starting the srsLTE eNodeB service.
+
+### Start EPC and eNB
+
+Login to `enb1` via `ssh` and start the srsLTE EPC services:
+
+```
+# start srsepc
+sudo srsepc
+```
+
+Then in another SSH session on `enb1`, start the eNB service.
+Substitute the IP address (or set it as an environment variable) in
+this command for the one captured for the `e2term-sctp` O-RAN service
+in the previous step.
+
+```
+# start srsenb (with agent connectivity to O-RAN RIC)
+sudo srsenb --ric.agent.remote_ipv4_addr=${E2TERM_IP} --log.all_level=warn --ric.agent.log_level=debug --log.filename=stdout
+```
+
+There will be output in srsenb and the O-RAN e2term mgmt and other
+service logs showing that the enb has connected to the O-RAN RIC.
+
+### Start the `kpimon` xApp
+
+Go back to the instructions in the O-RAN profile and follow the steps
+for starting the `kpimon` xApp (start with step 3 under "Running the
+O-RAN/srsLTE scp-kpimon demo").
+
+You should start seeing `srsenb` send periodic reports once the
+`kpimon` xApp starts.  These will appear in the `kpimon` xApp log
+output as well in the srsenb output.
+
+### Start the srsLTE UE
+
+SSH to `rue1` and run:
+
+```
+sudo srsue
+```
+
+You should see changes in the `kpimon` output when `srsue` is
+connected.  Try pinging `172.16.0.1` (the srs SPGW gateway address)
+from the UE and watch the `kpimon` counters tick.
 
 Note: this profile includes startup scripts that download, install, and
 configure the required software stacks. After the experiment becomes ready, wait
@@ -184,86 +249,94 @@ attach to `enb2`:
 Notice that the UE now indicates that it is attached to `enb2` (PCI 2) and is
 reporting measurements for `enb1` (PCI 1) as a neigbor cell. You can continue to
 adjust downlink attenuation levels to trigger more handover events.
-
 """
 
-BIN_PATH = "/local/repository/bin"
-DEPLOY_SRS = os.path.join(BIN_PATH, "deploy-srs.sh")
-TUNE_CPU = os.path.join(BIN_PATH, "tune-cpu.sh")
-NUC_HWTYPE = "nuc5300"
-UBUNTU_1804_IMG = "urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU18-64-STD"
-SRSLTE_IMG = "urn:publicid:IDN+emulab.net+image+PowderProfiles:U18LL-SRSLTE"
-
-
+# ======== PARAMETER DEFINITIONS ========
 pc = portal.Context()
-
 pc.defineParameter("enb1_node", "PhantomNet NUC+B210 for first eNodeB",
                    portal.ParameterType.STRING, "nuc2", advanced=True,
                    longDescription="Specific eNodeB node to bind to.")
-
 pc.defineParameter("enbfake_node", "PhantomNet NUC+B210 for fake eNodeB",
                    portal.ParameterType.STRING, "nuc4", advanced=True,
-                   longDescription="Specific eNodeB node to bind to.")
-
+                   longDescription="Specific fake eNodeB node to bind to.")
 pc.defineParameter("ue_node", "PhantomNet NUC+B210 for UE",
                    portal.ParameterType.STRING, "nuc1", advanced=True,
                    longDescription="Specific UE node to bind to.")
+pc.defineParameter("shared_vlan", "Shared VLAN name (optional)",
+                   portal.ParameterType.STRING, "", advanced=True,
+                   longDescription="Specify a shared VLAN if you want to connect to an existing shared network.")
 
 params = pc.bindParameters()
 pc.verifyParameters()
+
+# ======== HELPER FUNCTIONS ========
+def add_services(node, role):
+    """
+    Adds common services to the node, such as CPU tuning and srsLTE setup.
+    """
+    node.addService(rspec.Execute(shell="bash", command=GLOBALS.DEPLOY_SRS))
+    node.addService(rspec.Execute(shell="bash", command=GLOBALS.TUNE_CPU))
+    print(f"Added services to {role}")
+
+def create_node(name, component_id, role):
+    """
+    Creates a node with the specified name, hardware type, and role.
+    """
+    node = request.RawPC(name)
+    node.hardware_type = GLOBALS.NUC_HWTYPE
+    node.component_id = component_id
+    node.disk_image = GLOBALS.SRSLTE_IMG
+    node.Desire("rf-controlled", 1)
+    add_services(node, role)
+    return node
+
+def create_interface(node, iface_name, ip_address=None, vlan_name=None):
+    """
+    Creates an interface for the node. If a VLAN name is provided, binds the interface to the shared VLAN.
+    """
+    iface = node.addInterface(iface_name)
+    if ip_address:
+        iface.addAddress(rspec.IPv4Address(ip_address, "255.255.255.0"))
+    if vlan_name:
+        iface.vlan_name = vlan_name
+        print(f"Interface {iface_name} connected to shared VLAN: {vlan_name}")
+    return iface
+
+# ======== MAIN EXPERIMENT SETUP ========
 request = pc.makeRequestRSpec()
 
-ue = request.RawPC("ue")
-ue.hardware_type = NUC_HWTYPE
-ue.component_id = params.ue_node
+# Setup UE
+ue = create_node("ue", params.ue_node, "UE")
+ue_enb1_rf = create_interface(ue, "ue_enb1_rf")
+ue_enb_fake_rf = create_interface(ue, "ue_enb_fake_rf")
 
-ue.disk_image = SRSLTE_IMG
-ue.Desire("rf-controlled", 1)
-ue_enb1_rf = ue.addInterface("ue_enb1_rf")
-# ue_enb2_rf = ue.addInterface("ue_enb2_rf")
-ue_enb_fake_rf = ue.addInterface("ue_enb_fake_rf")
-ue.addService(rspec.Execute(shell="bash", command=DEPLOY_SRS))
-ue.addService(rspec.Execute(shell="bash", command=TUNE_CPU))
+# Setup first eNodeB
+enb1 = create_node("enb1", params.enb1_node, "eNodeB")
+enb1_s1_if = create_interface(enb1, "enb1_s1_if", "192.168.1.3", params.shared_vlan)
+enb1_ue_rf = create_interface(enb1, "enb1_ue_rf")
 
-enb1 = request.RawPC("enb")
-enb1.hardware_type = NUC_HWTYPE
-enb1.component_id = params.enb1_node
+# Setup fake eNodeB
+enb_fake = create_node("fake_enb", params.enbfake_node, "Fake eNodeB")
+enb_fake_s1_if = create_interface(enb_fake, "enb_fake_s1_if", "192.168.1.5", params.shared_vlan)
+enb_fake_ue_rf = create_interface(enb_fake, "enb_fake_ue_rf")
 
-enb1.disk_image = SRSLTE_IMG
-enb1_s1_if = enb1.addInterface("enb1_s1_if")
-enb1_s1_if.addAddress(rspec.IPv4Address("192.168.1.3", "255.255.255.0"))
-enb1.Desire("rf-controlled", 1)
-enb1_ue_rf = enb1.addInterface("enb1_ue_rf")
-enb1.addService(rspec.Execute(shell="bash", command=DEPLOY_SRS))
-enb1.addService(rspec.Execute(shell="bash", command=TUNE_CPU))
+# Create S1 links if shared VLAN is not specified
+if not params.shared_vlan:
+    s1_link = request.LAN("s1_lan")
+    s1_link.addInterface(enb1_s1_if)
+    s1_link.link_multiplexing = True
+    s1_link.vlan_tagging = True
+    s1_link.best_effort = True
 
-enb_fake = request.RawPC("fake_enb")
-enb_fake.hardware_type = NUC_HWTYPE
-enb_fake.component_id = params.enbfake_node
+    fake_s1_link = request.LAN("fake_s1_lan")
+    fake_s1_link.addInterface(enb_fake_s1_if)
+    fake_s1_link.link_multiplexing = True
+    fake_s1_link.vlan_tagging = True
+    fake_s1_link.best_effort = True
+else:
+    print("Using shared VLAN for S1 links.")
 
-enb_fake.disk_image = SRSLTE_IMG
-enb_fake_s1_if = enb_fake.addInterface("enb_fake_s1_if")
-enb_fake_s1_if.addAddress(rspec.IPv4Address("192.168.1.5", "255.255.255.0"))
-enb_fake.Desire("rf-controlled", 1)
-enb_fake_ue_rf = enb_fake.addInterface("enb_fake_ue_rf")
-enb_fake.addService(rspec.Execute(shell="bash", command=DEPLOY_SRS))
-enb_fake.addService(rspec.Execute(shell="bash", command=TUNE_CPU))
-
-# Create S1 links between eNodeBs and CN
-link = request.LAN("lan")
-link.addInterface(enb1_s1_if)
-link.link_multiplexing = True
-link.vlan_tagging = True
-link.best_effort = True
-
-
-fake_link = request.LAN("fake_lan")
-fake_link.addInterface(enb_fake_s1_if)
-fake_link.link_multiplexing = True
-fake_link.vlan_tagging = True
-fake_link.best_effort = True
-
-# Create RF links between the UE and eNodeBs
+# Create RF links
 rflink1 = request.RFLink("rflink1")
 rflink1.addInterface(enb1_ue_rf)
 rflink1.addInterface(ue_enb1_rf)
@@ -272,9 +345,11 @@ rflink_fake = request.RFLink("rflink_fake")
 rflink_fake.addInterface(enb_fake_ue_rf)
 rflink_fake.addInterface(ue_enb_fake_rf)
 
+# ======== TOUR INFORMATION ========
 tour = IG.Tour()
 tour.Description(IG.Tour.MARKDOWN, tourDescription)
 tour.Instructions(IG.Tour.MARKDOWN, tourInstructions)
 request.addTour(tour)
 
+# Print the RSpec request
 pc.printRequestRSpec(request)
