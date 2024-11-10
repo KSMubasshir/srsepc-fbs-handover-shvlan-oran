@@ -96,12 +96,10 @@ ue_enb_fake_rf = create_interface(ue, "ue_enb_fake_rf")
 
 # Setup first eNodeB
 enb1 = create_node("enb1", params.enb1_node, "eNodeB")
-enb1_s1_if = create_interface(enb1, "enb1_s1_if", "192.168.1.3", params.shared_vlan)
 enb1_ue_rf = create_interface(enb1, "enb1_ue_rf")
 
 # Setup fake eNodeB
 enb_fake = create_node("fake_enb", params.enbfake_node, "Fake eNodeB")
-enb_fake_s1_if = create_interface(enb_fake, "enb_fake_s1_if", "192.168.1.5", params.shared_vlan)
 enb_fake_ue_rf = create_interface(enb_fake, "enb_fake_ue_rf")
 
 # ======== SETUP NETWORK LINKS ========
@@ -117,7 +115,6 @@ rflink_fake.addInterface(ue_enb_fake_rf)
 # Create shared VLAN if specified
 if params.shared_vlan:
     connect_shared_vlan(enb1, params.shared_vlan, "192.168.1.3")
-    # connect_shared_vlan(enb_fake, params.shared_vlan, "192.168.1.5")
 
 # ======== TOUR INFORMATION ========
 tour = IG.Tour()
