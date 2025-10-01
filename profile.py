@@ -40,6 +40,22 @@ pc.defineParameter("enb1_node", "Node for eNB1", portal.ParameterType.STRING, "n
 pc.defineParameter("enbfake_node", "Node for fake eNB", portal.ParameterType.STRING, "nuc4", advanced=True)
 pc.defineParameter("ue_node", "Node for UE", portal.ParameterType.STRING, "nuc1", advanced=True)
 pc.defineParameter("shared_vlan", "Shared VLAN name (optional)", portal.ParameterType.STRING, "", advanced=True)
+pc.defineParameter(
+    "shared_vlan_netmask", "Shared VLAN IP Netmask",
+    portal.ParameterType.STRING, "255.255.255.0",
+    longDescription="Set the subnet mask for the shared VLAN interface.", advanced=True)
+pc.defineParameter(
+    "shared_vlan_gateway", "Shared VLAN Gateway Address",
+    portal.ParameterType.STRING, "192.168.1.1",
+    longDescription="The gateway IP address for the shared VLAN subnet.", advanced=True)
+pc.defineParameter(
+    "multiplex_lans", "Multiplex Networks",
+    portal.ParameterType.BOOLEAN, True,
+    longDescription="Multiplex any networks over physical interfaces using VLANs.", advanced=True)
+pc.defineParameter(
+    "install_vnc", "Install VNC on Compute Nodes",
+    portal.ParameterType.BOOLEAN, False,
+    longDescription="Install VNC on the compute nodes for remote desktop access.", advanced=True)
 
 params = pc.bindParameters()
 pc.verifyParameters()
@@ -47,13 +63,30 @@ pc.verifyParameters()
 # ======== MAIN EXPERIMENT SETUP ========
 request = pc.makeRequestRSpec()
 
+if params.install_vnc:
+    request.initVNC()
+
 # ======== HELPER FUNCTIONS ========
+def next_ipv4_addr(base_addr_str, mask_str, offset):
+    """
+    Calculate the next IP address given a base address, netmask, and offset.
+    """
+    bai = struct.unpack(">i", socket.inet_aton(base_addr_str))[0]
+    mi = struct.unpack(">i", socket.inet_aton(mask_str))[0]
+    ni = bai + offset
+    if bai & mi != ni & mi:
+        raise Exception("insufficient space in netmask %s to increment %s + %d" % (
+            mask_str, base_addr_str, offset))
+    return socket.inet_ntoa(struct.pack(">i", ni))
+
 def add_services(node, role):
     """
     Adds common services to the node, such as CPU tuning and srsLTE setup.
     """
     node.addService(rspec.Execute(shell="bash", command=GLOBALS.DEPLOY_SRS))
     node.addService(rspec.Execute(shell="bash", command=GLOBALS.TUNE_CPU))
+    if params.install_vnc:
+        node.startVNC()
 
 def create_node(name, component_id, role):
     """
@@ -78,15 +111,19 @@ def create_interface(node, iface_name, ip_address=None, vlan_name=None):
         iface.vlan_name = vlan_name
     return iface
 
-def connect_shared_vlan(node, vlan_name, ip_address):
+def connect_shared_vlan(node, vlan_name, ip_address, netmask):
     """
-    Connects the node to the shared VLAN.
+    Connects the node to the shared VLAN with full configuration support.
     """
-    iface = node.addInterface("shared_vlan_iface")
-    iface.addAddress(rspec.IPv4Address(ip_address, "255.255.255.0"))
-    link = request.Link(node.name + "_shared_vlan")
+    iface = node.addInterface("ifSharedVlan")
+    if ip_address:
+        iface.addAddress(rspec.IPv4Address(ip_address, netmask))
+    link = request.Link(node.name + "-shvlan")
     link.addInterface(iface)
     link.connectSharedVlan(vlan_name)
+    if params.multiplex_lans:
+        link.link_multiplexing = True
+        link.best_effort = True
 
 # ======== SETUP NODES ========
 # Setup UE node
@@ -114,7 +151,13 @@ rflink_fake.addInterface(ue_enb_fake_rf)
 
 # Create shared VLAN if specified
 if params.shared_vlan:
-    connect_shared_vlan(enb1, params.shared_vlan, "192.168.1.3")
+    # Calculate IP addresses for each node
+    enb1_ip = next_ipv4_addr(params.shared_vlan_gateway, params.shared_vlan_netmask, 2)
+    fake_enb_ip = next_ipv4_addr(params.shared_vlan_gateway, params.shared_vlan_netmask, 3)
+    
+    # Connect nodes to shared VLAN
+    connect_shared_vlan(enb1, params.shared_vlan, enb1_ip, params.shared_vlan_netmask)
+    connect_shared_vlan(enb_fake, params.shared_vlan, fake_enb_ip, params.shared_vlan_netmask)
 
 # ======== TOUR INFORMATION ========
 tour = IG.Tour()
