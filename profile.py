@@ -29,9 +29,26 @@ experimenting with LTE handover. It deploys srsRAN on three nodes: UE, eNB1, and
 tourInstructions = """
 ### Instructions
 
-1. Start EPC services on `enb1`.
-2. Start the `srsenb` service with the RIC agent configuration.
-3. Start the UE and observe handover events between `enb1` and `fake_enb`.
+**Prerequisites:** If using O-RAN integration, ensure you have an O-RAN experiment running 
+on the same shared VLAN with services accessible at the configured O-RAN gateway address.
+
+1. **Start EPC services on `enb1`:**
+   ```
+   sudo srsepc
+   ```
+
+2. **Start the `srsenb` service with RIC agent configuration:**
+   ```
+   sudo srsenb --ric.agent.remote_ipv4_addr=${E2TERM_IP} --log.all_level=warn --ric.agent.log_level=debug --log.filename=stdout
+   ```
+   (Replace `${E2TERM_IP}` with the actual O-RAN E2Term service IP if using O-RAN integration)
+
+3. **Start the UE and observe handover events:**
+   ```
+   sudo srsue
+   ```
+   
+4. **Monitor handover between `enb1` and `fake_enb`** and observe O-RAN RIC interactions if configured.
 """
 
 # ======== PARAMETER DEFINITIONS ========
@@ -56,6 +73,14 @@ pc.defineParameter(
     "install_vnc", "Install VNC on Compute Nodes",
     portal.ParameterType.BOOLEAN, False,
     longDescription="Install VNC on the compute nodes for remote desktop access.", advanced=True)
+pc.defineParameter(
+    "oran_address", "O-RAN Services Gateway Address",
+    portal.ParameterType.STRING, "10.254.254.1",
+    longDescription="The IP address of the O-RAN services gateway running on an adjacent experiment connected to the same shared VLAN.")
+pc.defineParameter(
+    "oran_virtual_subnets", "O-RAN Kubernetes Subnets to route via Gateway",
+    portal.ParameterType.STRING, "10.96.0.0/12",
+    longDescription="A space-separated list of subnets in CIDR format to route via the O-RAN Services Gateway Address.")
 
 params = pc.bindParameters()
 pc.verifyParameters()
@@ -83,6 +108,10 @@ def add_services(node, role):
     """
     Adds common services to the node, such as CPU tuning and srsLTE setup.
     """
+    # Add O-RAN IP configuration for eNodeB nodes
+    if role in ["eNodeB", "Fake eNodeB"] and params.shared_vlan:
+        node.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-ip-config.sh %s '%s'" % (params.oran_address, params.oran_virtual_subnets)))
+    
     node.addService(rspec.Execute(shell="bash", command=GLOBALS.DEPLOY_SRS))
     node.addService(rspec.Execute(shell="bash", command=GLOBALS.TUNE_CPU))
     if params.install_vnc:
@@ -151,9 +180,9 @@ rflink_fake.addInterface(ue_enb_fake_rf)
 
 # Create shared VLAN if specified
 if params.shared_vlan:
-    # Calculate IP addresses for each node
-    enb1_ip = next_ipv4_addr(params.shared_vlan_gateway, params.shared_vlan_netmask, 2)
-    fake_enb_ip = next_ipv4_addr(params.shared_vlan_gateway, params.shared_vlan_netmask, 3)
+    # Calculate IP addresses for each node using O-RAN address as base
+    enb1_ip = next_ipv4_addr(params.oran_address, params.shared_vlan_netmask, 1)
+    fake_enb_ip = next_ipv4_addr(params.oran_address, params.shared_vlan_netmask, 2)
     
     # Connect nodes to shared VLAN
     connect_shared_vlan(enb1, params.shared_vlan, enb1_ip, params.shared_vlan_netmask)
