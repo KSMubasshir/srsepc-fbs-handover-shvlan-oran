@@ -20,10 +20,21 @@ class GLOBALS(object):
 
 # ======== EXPERIMENT DESCRIPTION ========
 tourDescription = """
-### srsRAN S1 Handover w/ Open5GS
+### srsRAN S1 Handover w/ O-RAN Integration
 
 This profile allocates resources in a controlled RF environment for
-experimenting with LTE handover. It deploys srsRAN on three nodes: UE, eNB1, and a fake eNB2.
+experimenting with LTE handover and O-RAN integration. It deploys srsRAN on three nodes: UE, eNB1, and a fake eNB2.
+
+**Key Features:**
+- **Configurable O-RAN Integration**: Set custom gateway addresses and Kubernetes subnets during parameterization
+- **Shared VLAN Support**: Connect to existing O-RAN experiments with customizable network settings
+- **Handover Testing**: Experiment with S1 handover between multiple eNodeBs
+- **RIC Connectivity**: Ready for O-RAN RIC agent integration
+
+**Parameterization Options:**
+- Customize O-RAN gateway address (default: 10.254.254.1)
+- Configure Kubernetes subnets for routing (default: 10.96.0.0/12)
+- Set shared VLAN parameters to match your O-RAN experiment
 """
 
 tourInstructions = """
@@ -53,34 +64,54 @@ on the same shared VLAN with services accessible at the configured O-RAN gateway
 
 # ======== PARAMETER DEFINITIONS ========
 pc = portal.Context()
-pc.defineParameter("enb1_node", "Node for eNB1", portal.ParameterType.STRING, "nuc2", advanced=True)
-pc.defineParameter("enbfake_node", "Node for fake eNB", portal.ParameterType.STRING, "nuc4", advanced=True)
-pc.defineParameter("ue_node", "Node for UE", portal.ParameterType.STRING, "nuc1", advanced=True)
-pc.defineParameter("shared_vlan", "Shared VLAN name (optional)", portal.ParameterType.STRING, "", advanced=True)
+
+# Define parameter groups for better organization
+pc.defineParameterGroup("hardware", "Hardware Configuration")
+pc.defineParameterGroup("networking", "Network Configuration") 
+pc.defineParameterGroup("oran", "O-RAN Integration")
+pc.defineParameterGroup("advanced", "Advanced Options")
+
+pc.defineParameter("enb1_node", "Node for eNB1", portal.ParameterType.STRING, "nuc2", groupId="hardware")
+pc.defineParameter("enbfake_node", "Node for fake eNB", portal.ParameterType.STRING, "nuc4", groupId="hardware")
+pc.defineParameter("ue_node", "Node for UE", portal.ParameterType.STRING, "nuc1", groupId="hardware")
+# Network Configuration
+pc.defineParameter("shared_vlan", "Shared VLAN name (optional)", portal.ParameterType.STRING, "", 
+    longDescription="Name of an existing shared VLAN to connect to O-RAN experiment. Leave empty if not using O-RAN integration.",
+    groupId="networking")
 pc.defineParameter(
     "shared_vlan_netmask", "Shared VLAN IP Netmask",
     portal.ParameterType.STRING, "255.255.255.0",
-    longDescription="Set the subnet mask for the shared VLAN interface.", advanced=True)
+    longDescription="Set the subnet mask for the shared VLAN interface.", 
+    groupId="networking")
 pc.defineParameter(
     "shared_vlan_gateway", "Shared VLAN Gateway Address",
     portal.ParameterType.STRING, "192.168.1.1",
-    longDescription="The gateway IP address for the shared VLAN subnet.", advanced=True)
+    longDescription="The gateway IP address for the shared VLAN subnet. This should match the subnet used by your O-RAN experiment.", 
+    groupId="networking")
 pc.defineParameter(
     "multiplex_lans", "Multiplex Networks",
     portal.ParameterType.BOOLEAN, True,
-    longDescription="Multiplex any networks over physical interfaces using VLANs.", advanced=True)
-pc.defineParameter(
-    "install_vnc", "Install VNC on Compute Nodes",
-    portal.ParameterType.BOOLEAN, False,
-    longDescription="Install VNC on the compute nodes for remote desktop access.", advanced=True)
+    longDescription="Multiplex any networks over physical interfaces using VLANs.", 
+    groupId="advanced")
+
+# O-RAN Integration Parameters
 pc.defineParameter(
     "oran_address", "O-RAN Services Gateway Address",
     portal.ParameterType.STRING, "10.254.254.1",
-    longDescription="The IP address of the O-RAN services gateway running on an adjacent experiment connected to the same shared VLAN.")
+    longDescription="The IP address of the O-RAN services gateway running on an adjacent experiment connected to the same shared VLAN. Change this to match your O-RAN experiment's gateway address.",
+    groupId="oran")
 pc.defineParameter(
     "oran_virtual_subnets", "O-RAN Kubernetes Subnets to route via Gateway",
     portal.ParameterType.STRING, "10.96.0.0/12",
-    longDescription="A space-separated list of subnets in CIDR format to route via the O-RAN Services Gateway Address.")
+    longDescription="A space-separated list of subnets in CIDR format to route via the O-RAN Services Gateway Address. Common values: '10.96.0.0/12' for default Kubernetes, '10.244.0.0/16' for some CNI configurations.",
+    groupId="oran")
+
+# Advanced Options
+pc.defineParameter(
+    "install_vnc", "Install VNC on Compute Nodes",
+    portal.ParameterType.BOOLEAN, False,
+    longDescription="Install VNC on the compute nodes for remote desktop access.", 
+    groupId="advanced")
 
 params = pc.bindParameters()
 pc.verifyParameters()
