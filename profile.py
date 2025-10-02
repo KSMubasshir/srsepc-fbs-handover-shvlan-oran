@@ -15,6 +15,11 @@ class GLOBALS(object):
     BIN_PATH = "/local/repository/bin"
     DEPLOY_SRS = BIN_PATH + "/deploy-srs.sh"
     TUNE_CPU = BIN_PATH + "/tune-cpu.sh"
+    TUNE_B210 = BIN_PATH + "/tune-b210.sh"
+    SETUP_SRSLTE = BIN_PATH + "/setup-srslte.sh"
+    SETUP_IP_CONFIG = BIN_PATH + "/setup-ip-config.sh"
+    UPDATE_ENB_CONFIG = BIN_PATH + "/update-enb-config-files.sh"
+    UPDATE_UE_CONFIG = BIN_PATH + "/update-ue-config-files.sh"
     NUC_HWTYPE = "nuc5300"
     SRSLTE_IMG = "urn:publicid:IDN+emulab.net+image+PowderProfiles:U18LL-SRSLTE"
 
@@ -22,44 +27,131 @@ class GLOBALS(object):
 tourDescription = """
 ### srsRAN S1 Handover w/ O-RAN Integration
 
-This profile allocates resources in a controlled RF environment for
-experimenting with LTE handover and O-RAN integration. It deploys srsRAN on three nodes: UE, eNB1, and a fake eNB2.
+This profile creates a complete LTE testbed with S1 handover capabilities and optional O-RAN RIC integration. 
+It deploys srsRAN software on three Intel NUC nodes with B210 SDRs in a controlled RF environment.
 
-**Key Features:**
-- **Configurable O-RAN Integration**: Set custom gateway addresses and Kubernetes subnets during parameterization
-- **Shared VLAN Support**: Connect to existing O-RAN experiments with customizable network settings
-- **Handover Testing**: Experiment with S1 handover between multiple eNodeBs
-- **RIC Connectivity**: Ready for O-RAN RIC agent integration
+#### **Architecture**
+- **`ue` node**: srsUE (User Equipment) with B210 SDR
+- **`enb1` node**: srsEPC + srsENB (Primary eNodeB + Core Network) 
+- **`fake_enb` node**: srsENB (Secondary eNodeB for handover testing)
+- **Optional O-RAN**: Connect to separate O-RAN RIC experiment via shared VLAN
 
-**Parameterization Options:**
-- Customize O-RAN gateway address (default: 10.254.254.1)
-- Configure Kubernetes subnets for routing (default: 10.96.0.0/12)
-- Set shared VLAN parameters to match your O-RAN experiment
+#### **Key Capabilities**
+- **Complete LTE Stack**: Full EPC + eNB + UE deployment
+- **S1 Handover Testing**: Seamless handover between eNodeBs
+- **O-RAN RIC Integration**: E2 agent connectivity with configurable parameters
+
+#### **Parameterization Options**
+All key parameters are configurable during experiment instantiation:
+
+**Hardware Configuration:**
+- Select specific NUC nodes for each component
+
+**Network Configuration:**  
+- Shared VLAN name for O-RAN connectivity
+- Custom IP addressing and subnet masks
+- Network multiplexing options
+
+**O-RAN Integration:**
+- Gateway address (default: `10.254.254.1`)
+- Kubernetes subnets (default: `10.96.0.0/12`)
+- Fully customizable for your O-RAN experiment setup
+
+**Advanced Options:**
+- VNC remote desktop access
+- Network multiplexing control
 """
 
 tourInstructions = """
 ### Instructions
 
-**Prerequisites:** If using O-RAN integration, ensure you have an O-RAN experiment running 
-on the same shared VLAN with services accessible at the configured O-RAN gateway address.
+This profile provides a complete srsRAN S1 handover testbed with O-RAN integration capabilities.
 
-1. **Start EPC services on `enb1`:**
-   ```
-   sudo srsepc
-   ```
+#### **Prerequisites for O-RAN Integration (Optional)**
 
-2. **Start the `srsenb` service with RIC agent configuration:**
-   ```
-   sudo srsenb --ric.agent.remote_ipv4_addr=${E2TERM_IP} --log.all_level=warn --ric.agent.log_level=debug --log.filename=stdout
-   ```
-   (Replace `${E2TERM_IP}` with the actual O-RAN E2Term service IP if using O-RAN integration)
+If using O-RAN integration, first start an O-RAN experiment using the companion profile:
+- **O-RAN Profile**: `https://www.powderwireless.net/p/PowderProfiles/O-RAN`
+- Ensure it uses the **same shared VLAN** configured in this experiment
+- Note the **E2Term service IP** from the O-RAN experiment:
+  ```bash
+  kubectl get svc -n ricplt --field-selector metadata.name=service-ricplt-e2term-sctp-alpha -o jsonpath='{.items[0].spec.clusterIP}'
+  ```
 
-3. **Start the UE and observe handover events:**
-   ```
-   sudo srsue
-   ```
-   
-4. **Monitor handover between `enb1` and `fake_enb`** and observe O-RAN RIC interactions if configured.
+#### **Deployment Steps**
+
+**1. Setup and Verification**
+All nodes automatically run setup scripts during boot:
+- `setup-ip-config.sh` - Configures O-RAN routing (on eNB nodes)
+- `setup-srslte.sh` - Installs and configures srsRAN software
+- `tune-cpu.sh` & `tune-b210.sh` - Optimizes system performance
+- `update-*-config-files.sh` - Generates node-specific configurations
+
+**2. Start Core Network on `enb1`**
+```bash
+# SSH to enb1 node
+ssh enb1
+
+# Start the Evolved Packet Core (EPC)
+sudo srsepc
+```
+
+**3. Start Primary eNodeB on `enb1`** 
+In a new SSH session to `enb1`:
+```bash
+# For standalone operation (no O-RAN):
+sudo srsenb
+
+# For O-RAN integration (replace E2TERM_IP):
+sudo srsenb --ric.agent.remote_ipv4_addr=${E2TERM_IP} --log.all_level=warn --ric.agent.log_level=debug --log.filename=stdout
+```
+
+**4. Start Fake eNodeB for Handover Testing**
+```bash
+# SSH to fake_enb node  
+ssh fake_enb
+
+# Start the fake eNodeB (acts as handover target)
+sudo srsenb --enb.enb_id=0x20 --enb.cell_id=0x02 --enb.tac=0x0002
+```
+
+**5. Start UE and Test Connectivity**
+```bash
+# SSH to ue node
+ssh ue  
+
+# Start the User Equipment
+sudo srsue
+
+# In another terminal, test connectivity:
+ping 172.16.0.1  # Ping the EPC gateway
+```
+
+**6. Observe Handover Events**
+- Monitor logs on both `enb1` and `fake_enb` for S1 handover events
+- Watch O-RAN RIC interactions in the companion experiment (if configured)
+- UE should seamlessly hand over between the two eNodeBs
+
+#### **Advanced Configuration**
+
+**Custom UE/eNB Configuration:**
+- Configuration files are auto-generated in `/local/etc/srsran/`
+- Modify parameters and restart services as needed
+
+**O-RAN RIC Integration:**
+- Deploy `kpimon` xApp in O-RAN experiment after eNB connection
+- Monitor KPI reports and RIC control messages
+- Experiment with RIC-driven handover policies
+
+**Troubleshooting:**
+- Check `/var/log/` for service logs
+- Verify RF connectivity with `sudo /local/repository/bin/atten`
+- Use VNC (if enabled) for graphical debugging tools
+
+#### **Expected Results**
+- UE successfully attaches to `enb1`
+- Data connectivity through EPC core network  
+- Successful S1 handover to `fake_enb`
+- O-RAN RIC visibility into handover events (if configured)
 """
 
 # ======== PARAMETER DEFINITIONS ========
@@ -135,18 +227,50 @@ def next_ipv4_addr(base_addr_str, mask_str, offset):
             mask_str, base_addr_str, offset))
     return socket.inet_ntoa(struct.pack(">i", ni))
 
+def add_ue_services(ue, ue_index):
+    """
+    Adds services for UE nodes following srslte-shvlan-oran pattern.
+    """
+    ue.addService(rspec.Execute(shell="bash", command="/local/repository/bin/tune-cpu.sh"))
+    ue.addService(rspec.Execute(shell="bash", command="/local/repository/bin/tune-b210.sh"))
+    ue.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-srslte.sh"))
+    # Generate UE configuration with unique IMSI
+    imsi = "001010{:06d}{:03d}".format(12345, ue_index)
+    imei = "353490{:06d}{:03d}".format(12345, ue_index)
+    ue.addService(rspec.Execute(shell="bash", command="/local/repository/bin/update-ue-config-files.sh '%s,%s'" % (imsi, imei)))
+    if params.install_vnc:
+        ue.startVNC()
+
+def add_enb_services(enb, enb_index):
+    """
+    Adds services for eNodeB nodes following srslte-shvlan-oran pattern.
+    """
+    enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/tune-cpu.sh"))
+    enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/tune-b210.sh"))
+    
+    # Add O-RAN IP configuration if shared VLAN is enabled
+    if params.shared_vlan:
+        enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-ip-config.sh %s '%s'" % (params.oran_address, params.oran_virtual_subnets)))
+    
+    enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-srslte.sh"))
+    
+    # Configure eNB with UE information (simplified for handover scenario)
+    imsi = "001010{:06d}001".format(12345)  # Use consistent IMSI for handover
+    imei = "353490{:06d}001".format(12345)
+    ue_ip = "192.168.0.10"
+    enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/update-enb-config-files.sh '0x{:03x}' '{},{},{},{}'".format(enb_index, 1, imsi, imei, ue_ip)))
+    
+    if params.install_vnc:
+        enb.startVNC()
+
 def add_services(node, role):
     """
-    Adds common services to the node, such as CPU tuning and srsLTE setup.
+    Legacy function for backward compatibility - redirects to specific service functions.
     """
-    # Add O-RAN IP configuration for eNodeB nodes
-    if role in ["eNodeB", "Fake eNodeB"] and params.shared_vlan:
-        node.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-ip-config.sh %s '%s'" % (params.oran_address, params.oran_virtual_subnets)))
-    
-    node.addService(rspec.Execute(shell="bash", command=GLOBALS.DEPLOY_SRS))
-    node.addService(rspec.Execute(shell="bash", command=GLOBALS.TUNE_CPU))
-    if params.install_vnc:
-        node.startVNC()
+    if role == "UE":
+        add_ue_services(node, 1)
+    elif role in ["eNodeB", "Fake eNodeB"]:
+        add_enb_services(node, 1 if role == "eNodeB" else 2)
 
 def create_node(name, component_id, role):
     """
@@ -187,16 +311,31 @@ def connect_shared_vlan(node, vlan_name, ip_address, netmask):
 
 # ======== SETUP NODES ========
 # Setup UE node
-ue = create_node("ue", params.ue_node, "UE")
+ue = request.RawPC("ue")
+ue.hardware_type = GLOBALS.NUC_HWTYPE
+ue.component_id = params.ue_node
+ue.disk_image = GLOBALS.SRSLTE_IMG
+ue.Desire("rf-controlled", 1)
+add_ue_services(ue, 1)
 ue_enb1_rf = create_interface(ue, "ue_enb1_rf")
 ue_enb_fake_rf = create_interface(ue, "ue_enb_fake_rf")
 
 # Setup first eNodeB
-enb1 = create_node("enb1", params.enb1_node, "eNodeB")
+enb1 = request.RawPC("enb1")
+enb1.hardware_type = GLOBALS.NUC_HWTYPE
+enb1.component_id = params.enb1_node
+enb1.disk_image = GLOBALS.SRSLTE_IMG
+enb1.Desire("rf-controlled", 1)
+add_enb_services(enb1, 1)
 enb1_ue_rf = create_interface(enb1, "enb1_ue_rf")
 
 # Setup fake eNodeB
-enb_fake = create_node("fake_enb", params.enbfake_node, "Fake eNodeB")
+enb_fake = request.RawPC("fake_enb")
+enb_fake.hardware_type = GLOBALS.NUC_HWTYPE
+enb_fake.component_id = params.enbfake_node
+enb_fake.disk_image = GLOBALS.SRSLTE_IMG
+enb_fake.Desire("rf-controlled", 1)
+add_enb_services(enb_fake, 2)
 enb_fake_ue_rf = create_interface(enb_fake, "enb_fake_ue_rf")
 
 # ======== SETUP NETWORK LINKS ========
