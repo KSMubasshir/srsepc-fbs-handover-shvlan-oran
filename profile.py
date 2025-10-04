@@ -50,12 +50,12 @@ All key parameters are configurable during experiment instantiation:
 - Select specific NUC nodes for each component
 
 **Network Configuration:**  
-- Shared VLAN name for O-RAN connectivity
+- Shared VLAN options (only for remote O-RAN integration)
 - Custom IP addressing and subnet masks
 - Network multiplexing options
 
 **O-RAN Integration:**
-- **Local RIC Deployment**: Deploy O-RAN SC RIC directly on eNB1 (simplifies setup, no network issues)
+- **Local RIC Deployment**: Deploy O-RAN SC RIC directly on eNB1 (no VLAN setup needed)
 - **Remote RIC Connection**: Connect to separate O-RAN experiment via shared VLAN
 - Gateway address (default: `10.254.254.1`)
 - Kubernetes subnets (default: `10.96.0.0/12`)
@@ -78,12 +78,14 @@ Choose one of two O-RAN deployment methods:
 **Option 1: Local RIC Deployment (Recommended)**
 - Enable `Deploy O-RAN RIC on eNodeB` parameter during instantiation
 - O-RAN SC RIC will be automatically deployed on the eNB1 node
-- No separate experiment or network configuration needed
-- E2Term service runs locally at `127.0.0.1` or cluster IP
+- **No shared VLAN configuration needed** - VLAN options are automatically disabled
+- E2Term service runs locally accessible via cluster IP
 
 **Option 2: Remote RIC Connection**
+- Disable `Deploy O-RAN RIC on eNodeB` parameter
+- Configure shared VLAN parameters for remote O-RAN connectivity
 - First start an O-RAN experiment using the companion profile: `https://www.powderwireless.net/p/PowderProfiles/O-RAN`
-- Ensure it uses the **same shared VLAN** configured in this experiment
+- Ensure it uses the **same shared VLAN name** configured in this experiment
 - Note the **E2Term service IP** from the O-RAN experiment:
   ```bash
   kubectl get svc -n ricplt --field-selector metadata.name=service-ricplt-e2term-sctp-alpha -o jsonpath='{.items[0].spec.clusterIP}'
@@ -233,18 +235,18 @@ pc.defineParameter("enb1_node", "Node for eNB1", portal.ParameterType.STRING, "n
 pc.defineParameter("enbfake_node", "Node for fake eNB", portal.ParameterType.STRING, "nuc4", groupId="hardware")
 pc.defineParameter("ue_node", "Node for UE", portal.ParameterType.STRING, "nuc1", groupId="hardware")
 # Network Configuration
-pc.defineParameter("shared_vlan", "Shared VLAN name (optional)", portal.ParameterType.STRING, "", 
-    longDescription="Name of an existing shared VLAN to connect to O-RAN experiment. Leave empty if not using O-RAN integration.",
+pc.defineParameter("shared_vlan", "Shared VLAN name (for remote O-RAN only)", portal.ParameterType.STRING, "", 
+    longDescription="Name of an existing shared VLAN to connect to remote O-RAN experiment. Only used when 'Deploy O-RAN RIC on eNodeB' is disabled. Leave empty if using local O-RAN or no O-RAN integration.",
     groupId="networking")
 pc.defineParameter(
     "shared_vlan_netmask", "Shared VLAN IP Netmask",
     portal.ParameterType.STRING, "255.255.255.0",
-    longDescription="Set the subnet mask for the shared VLAN interface.", 
+    longDescription="Set the subnet mask for the shared VLAN interface. Only used with remote O-RAN integration.", 
     groupId="networking")
 pc.defineParameter(
     "shared_vlan_gateway", "Shared VLAN Gateway Address",
     portal.ParameterType.STRING, "192.168.1.1",
-    longDescription="The gateway IP address for the shared VLAN subnet. This should match the subnet used by your O-RAN experiment.", 
+    longDescription="The gateway IP address for the shared VLAN subnet. Only used with remote O-RAN integration.", 
     groupId="networking")
 pc.defineParameter(
     "multiplex_lans", "Multiplex Networks",
@@ -319,8 +321,8 @@ def add_enb_services(enb, enb_index):
         # Install Docker and Kubernetes
         enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-oran-local.sh"))
     
-    # Add O-RAN IP configuration if shared VLAN is enabled
-    if params.shared_vlan:
+    # Add O-RAN IP configuration only for remote O-RAN (not needed for local RIC)
+    if params.shared_vlan and not params.deploy_oran_locally:
         enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-ip-config.sh %s '%s'" % (params.oran_address, params.oran_virtual_subnets)))
     
     enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-srslte.sh"))
@@ -419,8 +421,8 @@ rflink_fake = request.RFLink("rflink_fake")
 rflink_fake.addInterface(enb_fake_ue_rf)
 rflink_fake.addInterface(ue_enb_fake_rf)
 
-# Create shared VLAN if specified
-if params.shared_vlan:
+# Create shared VLAN only for remote O-RAN integration (not needed for local RIC)
+if params.shared_vlan and not params.deploy_oran_locally:
     # Calculate IP addresses for each node using O-RAN address as base
     enb1_ip = next_ipv4_addr(params.oran_address, params.shared_vlan_netmask, 1)
     fake_enb_ip = next_ipv4_addr(params.oran_address, params.shared_vlan_netmask, 2)

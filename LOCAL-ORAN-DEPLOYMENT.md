@@ -57,7 +57,7 @@ The enhanced `srsepc-fbs-handover-with-oran` profile now supports deploying the 
 When instantiating the experiment:
 - Set `Deploy O-RAN RIC on eNodeB` parameter to `True`
 - Choose adequate hardware type (recommend `d740`)
-- No shared VLAN configuration needed
+- **Shared VLAN options are automatically disabled and ignored** when local RIC is enabled
 
 ### **2. Experiment Deployment**
 
@@ -182,8 +182,8 @@ kubectl logs -f -n ricplt -l app=ricplt-e2term-alpha
 
 | Aspect | Local RIC | Remote RIC (Shared VLAN) |
 |--------|-----------|-------------------------|
-| **Setup Complexity** | ✅ Simple (single experiment) | ❌ Complex (two experiments) |
-| **Network Dependencies** | ✅ None | ❌ Requires shared VLAN |  
+| **Setup Complexity** | ✅ Simple (single experiment, VLAN options disabled) | ❌ Complex (two experiments) |
+| **Network Dependencies** | ✅ None (VLAN automatically disabled) | ❌ Requires shared VLAN |  
 | **Resource Usage** | ❌ Higher on eNodeB node | ✅ Separate dedicated node |
 | **Deployment Time** | ✅ Faster (~25 min total) | ❌ Slower (~40+ min total) |
 | **Troubleshooting** | ✅ Single node debugging | ❌ Multi-experiment debugging |
