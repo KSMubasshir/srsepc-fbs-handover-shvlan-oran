@@ -34,7 +34,9 @@ It deploys srsRAN software on three Intel NUC nodes with B210 SDRs in a controll
 - **`ue` node**: srsUE (User Equipment) with B210 SDR
 - **`enb1` node**: srsEPC + srsENB (Primary eNodeB + Core Network) 
 - **`fake_enb` node**: srsENB (Secondary eNodeB for handover testing)
-- **Optional O-RAN**: Connect to separate O-RAN RIC experiment via shared VLAN
+- **O-RAN Integration Options**:
+  - **Local RIC**: Deploy O-RAN SC RIC directly on eNB1 node (simplified setup)
+  - **Remote RIC**: Connect to separate O-RAN RIC experiment via shared VLAN
 
 #### **Key Capabilities**
 - **Complete LTE Stack**: Full EPC + eNB + UE deployment
@@ -53,6 +55,8 @@ All key parameters are configurable during experiment instantiation:
 - Network multiplexing options
 
 **O-RAN Integration:**
+- **Local RIC Deployment**: Deploy O-RAN SC RIC directly on eNB1 (simplifies setup, no network issues)
+- **Remote RIC Connection**: Connect to separate O-RAN experiment via shared VLAN
 - Gateway address (default: `10.254.254.1`)
 - Kubernetes subnets (default: `10.96.0.0/12`)
 - Fully customizable for your O-RAN experiment setup
@@ -67,10 +71,18 @@ tourInstructions = """
 
 This profile provides a complete srsRAN S1 handover testbed with O-RAN integration capabilities.
 
-#### **Prerequisites for O-RAN Integration (Optional)**
+#### **O-RAN Integration Options**
 
-If using O-RAN integration, first start an O-RAN experiment using the companion profile:
-- **O-RAN Profile**: `https://www.powderwireless.net/p/PowderProfiles/O-RAN`
+Choose one of two O-RAN deployment methods:
+
+**Option 1: Local RIC Deployment (Recommended)**
+- Enable `Deploy O-RAN RIC on eNodeB` parameter during instantiation
+- O-RAN SC RIC will be automatically deployed on the eNB1 node
+- No separate experiment or network configuration needed
+- E2Term service runs locally at `127.0.0.1` or cluster IP
+
+**Option 2: Remote RIC Connection**
+- First start an O-RAN experiment using the companion profile: `https://www.powderwireless.net/p/PowderProfiles/O-RAN`
 - Ensure it uses the **same shared VLAN** configured in this experiment
 - Note the **E2Term service IP** from the O-RAN experiment:
   ```bash
@@ -97,12 +109,27 @@ sudo srsepc
 
 **3. Start Primary eNodeB on `enb1`** 
 In a new SSH session to `enb1`:
-```bash
-# For standalone operation (no O-RAN):
-sudo srsenb
 
-# For O-RAN integration (replace E2TERM_IP):
+**For Local O-RAN RIC (if enabled in parameters):**
+```bash
+# Get E2Term service IP from local RIC
+E2TERM_IP=$(/local/repository/bin/get-e2term-ip.sh | grep "E2Term SCTP IP:" | cut -d' ' -f4)
+
+# Start eNodeB with local RIC integration
 sudo srsenb --ric.agent.remote_ipv4_addr=${E2TERM_IP} --log.all_level=warn --ric.agent.log_level=debug --log.filename=stdout
+
+# Monitor RIC status: /local/repository/bin/manage-oran-ric.sh status
+```
+
+**For Remote O-RAN RIC (via shared VLAN):**
+```bash
+# Use E2Term IP from remote O-RAN experiment
+sudo srsenb --ric.agent.remote_ipv4_addr=${E2TERM_IP} --log.all_level=warn --ric.agent.log_level=debug --log.filename=stdout
+```
+
+**For standalone operation (no O-RAN):**
+```bash
+sudo srsenb
 ```
 
 **4. Start Fake eNodeB for Handover Testing**
@@ -128,8 +155,42 @@ ping 172.16.0.1  # Ping the EPC gateway
 
 **6. Observe Handover Events**
 - Monitor logs on both `enb1` and `fake_enb` for S1 handover events
-- Watch O-RAN RIC interactions in the companion experiment (if configured)
+- Watch O-RAN RIC interactions (local or remote, if configured)
 - UE should seamlessly hand over between the two eNodeBs
+
+#### **Local O-RAN RIC Management**
+
+If you enabled local O-RAN RIC deployment, use these management commands on `enb1`:
+
+```bash
+# Check RIC status
+/local/repository/bin/manage-oran-ric.sh status
+
+# Get E2Term IP for eNodeB configuration
+/local/repository/bin/manage-oran-ric.sh e2term-ip
+
+# Monitor E2 termination logs
+/local/repository/bin/manage-oran-ric.sh logs e2term-alpha
+
+# Restart RIC services if needed
+/local/repository/bin/manage-oran-ric.sh restart
+
+# Direct kubectl access to RIC
+kubectl get pods -n ricplt
+kubectl logs -f -n ricplt -l app=ricplt-e2mgr
+```
+
+#### **Troubleshooting Local O-RAN**
+
+**RIC not starting:**
+1. Check Docker status: `systemctl status docker`
+2. Verify kind cluster: `kind get clusters`
+3. Check pod status: `kubectl get pods -n ricplt -n ricinfra`
+
+**E2 connection failures:**
+1. Verify E2Term service: `kubectl get svc -n ricplt service-ricplt-e2term-sctp-alpha`
+2. Check E2Term logs: `kubectl logs -n ricplt -l app=ricplt-e2term-alpha`
+3. Test connectivity: `telnet <E2TERM_IP> 36421`
 
 #### **Advanced Configuration**
 
@@ -162,6 +223,11 @@ pc.defineParameterGroup("hardware", "Hardware Configuration")
 pc.defineParameterGroup("networking", "Network Configuration") 
 pc.defineParameterGroup("oran", "O-RAN Integration")
 pc.defineParameterGroup("advanced", "Advanced Options")
+
+# O-RAN Integration
+pc.defineParameter("deploy_oran_locally", "Deploy O-RAN RIC on eNodeB", portal.ParameterType.BOOLEAN, False,
+    longDescription="Deploy O-RAN SC RIC directly on the eNB1 node instead of using separate experiment. Simplifies setup and eliminates network issues.",
+    groupId="oran")
 
 pc.defineParameter("enb1_node", "Node for eNB1", portal.ParameterType.STRING, "nuc2", groupId="hardware")
 pc.defineParameter("enbfake_node", "Node for fake eNB", portal.ParameterType.STRING, "nuc4", groupId="hardware")
@@ -247,6 +313,11 @@ def add_enb_services(enb, enb_index):
     """
     enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/tune-cpu.sh"))
     enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/tune-b210.sh"))
+    
+    # Deploy O-RAN RIC locally on eNB1 if enabled (only on the primary eNodeB)
+    if params.deploy_oran_locally and enb_index == 1:
+        # Install Docker and Kubernetes
+        enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-oran-local.sh"))
     
     # Add O-RAN IP configuration if shared VLAN is enabled
     if params.shared_vlan:
