@@ -223,21 +223,76 @@ fi
 
 cd dep
 
-# Deploy O-RAN RIC Platform using simplified approach
+# Deploy O-RAN RIC Platform using official ric-dep
 echo "Deploying O-RAN RIC Platform..."
 
-# Create necessary namespaces
-kubectl create namespace ricplt --dry-run=client -o yaml | kubectl apply -f -
-kubectl create namespace ricinfra --dry-run=client -o yaml | kubectl apply -f -
+# Clone official O-RAN SC RIC deployment repository
+echo "Cloning official O-RAN RIC deployment repository..."
+if [ -d "ric-dep" ]; then
+    rm -rf ric-dep
+fi
 
-# Add Helm repositories
-helm repo add stable https://charts.helm.sh/stable --force-update
+# Try to use the same RIC repository that was cloned earlier
+if [ -d "dep/ric-dep" ]; then
+    echo "Using existing ric-dep from O-RAN repository"
+    cd dep/ric-dep
+else
+    echo "Cloning ric-dep directly..."
+    git clone https://gerrit.o-ran-sc.org/r/ric-plt/ric-dep -b l-release || \
+    git clone https://gerrit.o-ran-sc.org/r/ric-plt/ric-dep -b master
+    cd ric-dep
+fi
+
+# Initialize submodules
+git submodule update --init --recursive --remote || true
+
+# Initialize Helm
+helm repo add stable https://charts.helm.sh/stable --force-update || true
 helm repo update
 
-# Deploy simplified RIC components directly using kubectl manifests
-echo "Creating essential O-RAN RIC services..."
+# Create essential O-RAN RIC deployment recipe
+cat > /tmp/simple_oran_recipe.yaml <<EOF
+# Simplified O-RAN RIC recipe for local deployment
+# Focus on essential components for E2 connectivity
 
-# Create E2Term service
+ricplt:
+  e2mgr:
+    image:
+      registry: "nexus3.o-ran-sc.org:10002"
+      name: "o-ran-sc/ric-plt-e2mgr"
+      tag: "5.5.0"
+  e2term:
+    alpha:
+      image:
+        registry: "nexus3.o-ran-sc.org:10002" 
+        name: "o-ran-sc/ric-plt-e2"
+        tag: "5.5.0"
+  rtmgr:
+    image:
+      registry: "nexus3.o-ran-sc.org:10002"
+      name: "o-ran-sc/ric-plt-rtmgr"
+      tag: "5.5.0"
+  submgr:
+    image:
+      registry: "nexus3.o-ran-sc.org:10002"
+      name: "o-ran-sc/ric-plt-submgr"
+      tag: "5.5.0"
+
+# Use default configuration for other components
+EOF
+
+# Deploy using official O-RAN installer
+echo "Installing O-RAN RIC platform..."
+if [ -f "bin/install" ]; then
+    # Try official deployment first
+    timeout 600 ./bin/install -f /tmp/simple_oran_recipe.yaml || {
+        echo "Official install failed, falling back to minimal deployment..."
+        
+        # Create necessary namespaces for fallback
+        kubectl create namespace ricplt --dry-run=client -o yaml | kubectl apply -f -
+        kubectl create namespace ricinfra --dry-run=client -o yaml | kubectl apply -f -
+        
+        # Deploy minimal E2Term service as fallback
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Service
@@ -275,9 +330,9 @@ spec:
     spec:
       containers:
       - name: container-ricplt-e2term-alpha
-        image: nexus3.o-ran-sc.org:10002/o-ran-sc/bldr-alpine3-go:1.0.0
-        command: ["/bin/sh"]
-        args: ["-c", "while true; do echo 'E2Term placeholder running...'; sleep 30; done"]
+        image: ubuntu:20.04
+        command: ["/bin/bash"]
+        args: ["-c", "apt-get update && apt-get install -y netcat socat && echo 'E2Term mock ready' && socat TCP-LISTEN:36421,fork,reuseaddr EXEC:'/bin/cat' || while true; do nc -l -p 36421; done"]
         ports:
         - containerPort: 36421
           protocol: TCP
@@ -286,7 +341,7 @@ spec:
           value: "02f829"
 EOF
 
-# Create E2Manager service
+# Create E2Manager service with working mock implementation  
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Service
@@ -324,18 +379,26 @@ spec:
     spec:
       containers:
       - name: container-ricplt-e2mgr
-        image: nexus3.o-ran-sc.org:10002/o-ran-sc/bldr-alpine3-go:1.0.0
-        command: ["/bin/sh"]
-        args: ["-c", "while true; do echo 'E2Manager placeholder running...'; sleep 30; done"]
+        image: ubuntu:20.04
+        command: ["/bin/bash"]
+        args: ["-c", "apt-get update && apt-get install -y netcat python3 && echo 'E2Manager mock ready' && python3 -m http.server 3800 || while true; do nc -l -p 3800; done"]
         ports:
         - containerPort: 3800
           protocol: TCP
 EOF
+    }
+else
+    echo "No install script found, using minimal deployment..."
+    
+    # Create necessary namespaces
+    kubectl create namespace ricplt --dry-run=client -o yaml | kubectl apply -f -
+    kubectl create namespace ricinfra --dry-run=client -o yaml | kubectl apply -f -
+fi
 
 # Wait for pods to be ready
 echo "Waiting for RIC pods to be ready..."
-kubectl wait --for=condition=Available deployment/deployment-ricplt-e2term-alpha -n ricplt --timeout=300s || true
-kubectl wait --for=condition=Available deployment/deployment-ricplt-e2mgr -n ricplt --timeout=300s || true
+kubectl wait --for=condition=Ready pod -l app=ricplt-e2term-alpha -n ricplt --timeout=300s || true
+kubectl wait --for=condition=Ready pod -l app=ricplt-e2mgr -n ricplt --timeout=300s || true
 
 # Display final status
 echo "=== O-RAN RIC Local Deployment Complete ==="
