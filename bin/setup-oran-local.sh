@@ -2,7 +2,47 @@
 #
 # setup-oran-local.sh - Deploy O-RAN SC RIC locally on eNodeB node
 #
-# This script sets up O-RAN SC Near-RT RIC directly on the eNodeB node
+# This script sets up O-RAN SC Nea# Clone O-RAN SC deployment scripts
+echo "Cloning O-RAN SC deployment repository..."
+if [ ! -d "dep" ]; then
+    # Try different branches in order of preference
+    BRANCH_OPTIONS=("${ORAN_VERSION}" "master" "l-release" "cherry")
+    REPO_SUCCESS=false
+    
+    for branch in "${BRANCH_OPTIONS[@]}"; do
+        echo "Trying branch: $branch"
+        
+        # Try primary repository first
+        if git clone --recurse-submodules -b "$branch" "https://gerrit.o-ran-sc.org/r/it/dep" dep 2>/dev/null; then
+            echo "Successfully cloned from gerrit.o-ran-sc.org using branch $branch"
+            REPO_SUCCESS=true
+            break
+        fi
+        
+        # Clean up failed attempt
+        rm -rf dep 2>/dev/null
+        
+        # Try GitHub mirror
+        if git clone --recurse-submodules -b "$branch" "https://github.com/o-ran-sc/it-dep.git" dep 2>/dev/null; then
+            echo "Successfully cloned from GitHub mirror using branch $branch"
+            REPO_SUCCESS=true
+            break
+        fi
+        
+        # Clean up failed attempt
+        rm -rf dep 2>/dev/null
+        echo "Branch $branch not found, trying next option..."
+    done
+    
+    if [ "$REPO_SUCCESS" = false ]; then
+        echo "Error: Could not clone O-RAN deployment repository with any available branch"
+        echo "Tried branches: ${BRANCH_OPTIONS[*]}"
+        echo "Please check network connectivity and repository availability"
+        exit 1
+    fi
+else
+    echo "O-RAN deployment repository already exists"
+fily on the eNodeB node
 # to eliminate network connectivity issues and simplify deployment.
 #
 
@@ -15,7 +55,7 @@ exec 2>&1
 
 ORAN_SETUP_DIR="/local/setup/oran"
 KUBERNETES_VERSION="v1.26.15"
-ORAN_VERSION="g"
+ORAN_VERSION="l-release"  # Updated to use existing branch
 RICPLT_RELEASE="3.0.1"
 
 echo "=========================================="
@@ -181,38 +221,165 @@ kubectl config use-context kind-oran-local
 echo "Waiting for cluster to be ready..."
 kubectl wait --for=condition=Ready nodes --all --timeout=300s
 
-# Create O-RAN recipe configuration
-echo "Creating O-RAN recipe configuration..."
-cd $ORAN_SETUP_DIR/dep/bin
-cat > ../example_recipe_local.yaml << EOF
-#
-# Local O-RAN deployment recipe for eNodeB integration
-#
-ricplt:
-  release_name: ricplt
-  ricplt_recipe: RIC_PLATFORM_RECIPE
-  ricplt_release_name: ${RICPLT_RELEASE}
-  ricplt_namespace: ricplt
-  
-ricinfra:
-  release_name: ricinfra  
-  ricinfra_recipe: RIC_INFRA_RECIPE
-  ricinfra_release_name: 3.0.0
-  ricinfra_namespace: ricinfra
+# Deploy essential O-RAN components directly using Helm
+echo "Deploying essential O-RAN SC components..."
 
-# Basic deployment - no auxiliary services for simplicity
+# Create namespaces
+kubectl create namespace ricplt --dry-run=client -o yaml | kubectl apply -f -
+kubectl create namespace ricinfra --dry-run=client -o yaml | kubectl apply -f -
+
+# Add O-RAN helm repositories
+echo "Adding O-RAN Helm repositories..."
+helm repo add oran https://gerrit.o-ran-sc.org/r/it/dep/raw/l-release || \
+helm repo add oran https://charts.o-ran-sc.org || \
+echo "Warning: Could not add O-RAN helm repo, will use direct images"
+
+helm repo update || echo "Warning: Could not update helm repos"
+
+# Deploy Redis (required for RIC platform)
+echo "Deploying Redis for RIC platform..."
+helm install redis-ricplt oci://registry-1.docker.io/bitnamicharts/redis \
+    --namespace ricinfra \
+    --set auth.enabled=false \
+    --set replica.replicaCount=1 \
+    --wait --timeout=300s
+
+# Deploy essential RIC platform components using direct manifests
+echo "Deploying RIC platform components..."
+
+# E2Term deployment
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deployment-ricplt-e2term-alpha
+  namespace: ricplt
+  labels:
+    app: ricplt-e2term-alpha
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ricplt-e2term-alpha
+  template:
+    metadata:
+      labels:
+        app: ricplt-e2term-alpha
+    spec:
+      containers:
+      - name: e2term
+        image: nexus3.o-ran-sc.org:10004/o-ran-sc/ric-plt-e2:6.0.1
+        ports:
+        - containerPort: 36421
+          protocol: SCTP
+        - containerPort: 36422
+          protocol: TCP
+        env:
+        - name: RIC_ID
+          value: "bbbccc-abcd0e-def123"
+        - name: SCTP_PORT
+          value: "36421"
+        - name: HTTP_PORT  
+          value: "36422"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-ricplt-e2term-sctp-alpha
+  namespace: ricplt
+spec:
+  selector:
+    app: ricplt-e2term-alpha
+  ports:
+  - port: 36421
+    targetPort: 36421
+    protocol: SCTP
+    name: sctp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-ricplt-e2term-alpha
+  namespace: ricplt
+spec:
+  selector:
+    app: ricplt-e2term-alpha
+  ports:
+  - port: 36422
+    targetPort: 36422
+    protocol: TCP
+    name: http
 EOF
 
-# Deploy O-RAN SC RIC Platform
-echo "Deploying O-RAN SC RIC Platform..."
-./deploy-ric-platform -f ../example_recipe_local.yaml
+# E2Manager deployment
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deployment-ricplt-e2mgr
+  namespace: ricplt
+  labels:
+    app: ricplt-e2mgr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ricplt-e2mgr
+  template:
+    metadata:
+      labels:
+        app: ricplt-e2mgr
+    spec:
+      containers:
+      - name: e2mgr
+        image: nexus3.o-ran-sc.org:10004/o-ran-sc/ric-plt-e2mgr:5.4.14
+        env:
+        - name: RIC_ID
+          value: "bbbccc-abcd0e-def123"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-ricplt-e2mgr-http
+  namespace: ricplt
+spec:
+  selector:
+    app: ricplt-e2mgr
+  ports:
+  - port: 3800
+    targetPort: 3800
+    protocol: TCP
+EOF
 
-# Wait for RIC platform to be ready
-echo "Waiting for RIC platform pods to be ready..."
-for ns in ricinfra ricplt; do
-    echo "Waiting for pods in namespace $ns..."
-    kubectl wait --for=condition=Ready pods --all -n $ns --timeout=600s
-done
+# Subscription Manager
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1  
+kind: Deployment
+metadata:
+  name: deployment-ricplt-submgr
+  namespace: ricplt
+  labels:
+    app: ricplt-submgr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ricplt-submgr
+  template:
+    metadata:
+      labels:
+        app: ricplt-submgr
+    spec:
+      containers:
+      - name: submgr
+        image: nexus3.o-ran-sc.org:10004/o-ran-sc/ric-plt-submgr:0.15.5
+EOF
+
+# Wait for essential components to be ready
+echo "Waiting for essential RIC components to be ready..."
+kubectl wait --for=condition=Available deployment/deployment-ricplt-e2term-alpha -n ricplt --timeout=300s
+kubectl wait --for=condition=Available deployment/deployment-ricplt-e2mgr -n ricplt --timeout=300s
+kubectl wait --for=condition=Available deployment/deployment-ricplt-submgr -n ricplt --timeout=300s
 
 # Get E2Term service information
 echo "Getting E2Term service information..."
@@ -303,4 +470,6 @@ echo ""
 echo "Configure srsRAN eNodeB with:"
 echo "  --ric.agent.remote_ipv4_addr=$E2TERM_IP"
 echo ""
+
+fi
 echo "Setup log available at: $LOG_FILE"
