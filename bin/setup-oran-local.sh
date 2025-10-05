@@ -2,7 +2,22 @@
 #
 # setup-oran-local.sh - Deploy O-RAN SC RIC locally on eNodeB node
 #
-# This script sets up O-RAN SC Nea# Clone O-RAN SC deployment scripts
+# This script sets up O-RAN SC Near-RT RIC components locally using kind
+
+set -e
+
+LOG_FILE="/var/log/setup-oran-local.log"
+exec > >(tee -a $LOG_FILE) 2>&1
+
+echo "=== Starting O-RAN RIC Local Deployment Setup ==="
+echo "Timestamp: $(date)"
+echo "Log file: $LOG_FILE"
+
+# Update system packages
+echo "Updating system packages..."
+sudo apt-get update
+
+# Clone O-RAN SC deployment scripts
 echo "Cloning O-RAN SC deployment repository..."
 if [ ! -d "dep" ]; then
     # Try different branches in order of preference
@@ -42,11 +57,7 @@ if [ ! -d "dep" ]; then
     fi
 else
     echo "O-RAN deployment repository already exists"
-fily on the eNodeB node
-# to eliminate network connectivity issues and simplify deployment.
-#
-
-set -e
+fi
 
 # Set up logging
 LOG_FILE="/var/log/setup-oran-local.log"
@@ -339,6 +350,7 @@ kubectl get svc -n ricplt
 echo ""
 echo "E2Term service IP:"
 kubectl get svc service-ricplt-e2term-sctp-alpha -n ricplt -o jsonpath='{.spec.clusterIP}'
+echo ""
 echo ""
 echo ""
 echo "Setup completed successfully!"
