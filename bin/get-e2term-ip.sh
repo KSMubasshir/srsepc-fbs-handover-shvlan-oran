@@ -18,7 +18,7 @@ if ! kubectl get namespace ricplt &> /dev/null; then
 fi
 
 # Get the E2Term service IP
-E2TERM_IP=$(kubectl get service e2term-sctp-alpha -n ricplt -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+E2TERM_IP=$(kubectl get service service-ricplt-e2term-sctp-alpha -n ricplt -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
 
 if [ -z "$E2TERM_IP" ]; then
     echo "Error: E2Term service not found or not ready"
