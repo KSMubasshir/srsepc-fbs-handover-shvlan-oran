@@ -307,6 +307,10 @@ spec:
     port: 36421
     protocol: TCP
     targetPort: 36421
+  - name: sctp-srsran
+    port: 36422
+    protocol: TCP
+    targetPort: 36421
   selector:
     app: ricplt-e2term-alpha
   type: ClusterIP

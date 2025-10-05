@@ -27,4 +27,15 @@ if [ -z "$E2TERM_IP" ]; then
     exit 1
 fi
 
-echo "$E2TERM_IP"
+# Check which ports are available
+PORTS=$(kubectl get service service-ricplt-e2term-sctp-alpha -n ricplt -o jsonpath='{.spec.ports[*].port}' 2>/dev/null)
+
+echo "E2Term SCTP IP: $E2TERM_IP"
+echo "Available ports: $PORTS"
+echo ""
+echo "For srsRAN connection use:"
+if echo "$PORTS" | grep -q "36422"; then
+    echo "  --ric.agent.remote_ipv4_addr=$E2TERM_IP (uses default port 36422)"
+else
+    echo "  --ric.agent.remote_ipv4_addr=$E2TERM_IP --ric.agent.remote_port=36421"
+fi
