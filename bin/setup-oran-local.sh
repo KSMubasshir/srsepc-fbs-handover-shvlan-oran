@@ -8,6 +8,11 @@
 
 set -e
 
+# Set up logging
+LOG_FILE="/var/log/setup-oran-local.log"
+exec 1> >(tee -a "$LOG_FILE")
+exec 2>&1
+
 ORAN_SETUP_DIR="/local/setup/oran"
 KUBERNETES_VERSION="v1.26.15"
 ORAN_VERSION="g"
@@ -15,7 +20,15 @@ RICPLT_RELEASE="3.0.1"
 
 echo "=========================================="
 echo "Setting up O-RAN SC RIC locally on eNodeB"
+echo "Start time: $(date)"
 echo "=========================================="
+
+# Basic network connectivity check
+echo "Checking network connectivity..."
+if ! ping -c 1 8.8.8.8 >/dev/null 2>&1; then
+    echo "Warning: Limited network connectivity detected. Some downloads may fail."
+    echo "Continuing with available methods..."
+fi
 
 # Update system and install dependencies
 echo "Installing system dependencies..."
@@ -63,11 +76,26 @@ fi
 # Install Helm
 echo "Installing Helm..."
 if ! command -v helm &> /dev/null; then
-    curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | tee /usr/share/keyrings/helm.gpg > /dev/null
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | tee /etc/apt/sources.list.d/helm-stable-debian.list
-    apt-get update
-    apt-get install -y helm
-    echo "Helm installed successfully"
+    # Method 1: Try direct binary download from GitHub
+    echo "Downloading Helm binary directly..."
+    if curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 2>/dev/null; then
+        chmod 700 get_helm.sh
+        ./get_helm.sh
+        rm get_helm.sh
+        echo "Helm installed successfully via GitHub"
+    else
+        # Method 2: Fallback to direct binary download
+        echo "GitHub method failed, trying direct binary download..."
+        HELM_VERSION="v3.12.3"
+        wget -O helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" || \
+        curl -L -o helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+        
+        tar -zxvf helm.tar.gz
+        mv linux-amd64/helm /usr/local/bin/helm
+        rm -rf helm.tar.gz linux-amd64/
+        chmod +x /usr/local/bin/helm
+        echo "Helm installed successfully via direct download"
+    fi
 else
     echo "Helm already installed"
 fi
@@ -90,7 +118,15 @@ cd $ORAN_SETUP_DIR
 # Clone O-RAN SC deployment scripts
 echo "Cloning O-RAN SC deployment repository..."
 if [ ! -d "dep" ]; then
-    git clone --recurse-submodules -b ${ORAN_VERSION}-release "https://gerrit.o-ran-sc.org/r/it/dep" dep
+    # Try primary repository first
+    if ! git clone --recurse-submodules -b ${ORAN_VERSION}-release "https://gerrit.o-ran-sc.org/r/it/dep" dep; then
+        echo "Primary repository failed, trying GitHub mirror..."
+        git clone --recurse-submodules -b ${ORAN_VERSION}-release "https://github.com/o-ran-sc/it-dep.git" dep || {
+            echo "Error: Could not clone O-RAN deployment repository"
+            echo "Please check network connectivity and try again"
+            exit 1
+        }
+    fi
 else
     echo "O-RAN deployment repository already exists"
 fi
@@ -126,7 +162,13 @@ EOF
 # Create kind cluster
 echo "Creating kind Kubernetes cluster..."
 if ! kind get clusters | grep -q "oran-local"; then
-    kind create cluster --name oran-local --config kind-config.yaml
+    echo "This may take several minutes as container images are downloaded..."
+    if ! kind create cluster --name oran-local --config kind-config.yaml; then
+        echo "Error: Failed to create kind cluster"
+        echo "This might be due to network issues downloading container images"
+        echo "You can try running the script again, or check Docker connectivity"
+        exit 1
+    fi
     echo "Kind cluster 'oran-local' created successfully"
 else
     echo "Kind cluster 'oran-local' already exists"
@@ -248,6 +290,7 @@ echo "export KUBECONFIG=/root/.kube/config" >> /home/$(logname)/.bashrc
 
 echo "=========================================="
 echo "O-RAN SC RIC setup completed successfully!"
+echo "Completion time: $(date)"
 echo "=========================================="
 echo ""
 echo "E2Term service IP: $E2TERM_IP"
@@ -260,3 +303,4 @@ echo ""
 echo "Configure srsRAN eNodeB with:"
 echo "  --ric.agent.remote_ipv4_addr=$E2TERM_IP"
 echo ""
+echo "Setup log available at: $LOG_FILE"

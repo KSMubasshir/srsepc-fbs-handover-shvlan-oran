@@ -95,10 +95,19 @@ Choose one of two O-RAN deployment methods:
 
 **1. Setup and Verification**
 All nodes automatically run setup scripts during boot:
-- `setup-ip-config.sh` - Configures O-RAN routing (on eNB nodes)
-- `setup-srslte.sh` - Installs and configures srsRAN software
-- `tune-cpu.sh` & `tune-b210.sh` - Optimizes system performance
-- `update-*-config-files.sh` - Generates node-specific configurations
+- `setup-srslte.sh` - Installs and configures srsRAN software (~5 min)
+- `tune-cpu.sh` & `tune-b210.sh` - Optimizes system performance (~2 min)
+- `update-*-config-files.sh` - Generates node-specific configurations (~1 min)
+- `setup-oran-local.sh` - Deploys O-RAN RIC (if enabled, ~20-25 min)
+
+**For Local O-RAN Setup Progress:**
+```bash
+# Check setup progress on enb1 (available immediately)
+/local/repository/bin/check-oran-setup.sh
+
+# Monitor setup logs in real-time (if needed)
+tail -f /var/log/setup-oran-local.log
+```
 
 **2. Start Core Network on `enb1`**
 ```bash
@@ -114,7 +123,10 @@ In a new SSH session to `enb1`:
 
 **For Local O-RAN RIC (if enabled in parameters):**
 ```bash
-# Get E2Term service IP from local RIC
+# Wait for O-RAN setup to complete (~20-25 minutes after node boot)
+# Check setup progress: /local/repository/bin/check-oran-setup.sh
+
+# Once setup is complete, get E2Term service IP from local RIC
 E2TERM_IP=$(/local/repository/bin/get-e2term-ip.sh | grep "E2Term SCTP IP:" | cut -d' ' -f4)
 
 # Start eNodeB with local RIC integration
