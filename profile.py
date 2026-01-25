@@ -243,10 +243,18 @@ pc.defineParameter("deploy_oran_locally", "Deploy O-RAN RIC on eNodeB", portal.P
     longDescription="Deploy O-RAN SC RIC directly on the eNB1 node instead of using separate experiment. Simplifies setup and eliminates network issues.",
     groupId="oran")
 
+# Hardware Configuration - EPC is optional (if disabled, EPC runs on enb1)
+pc.defineParameter("deploy_epc_node", "Deploy separate EPC node", portal.ParameterType.BOOLEAN, False,
+    longDescription="Deploy a separate EPC node. If disabled, the EPC will run on the enb1 node.",
+    groupId="hardware")
+pc.defineParameter("epc_node", "Node for EPC", portal.ParameterType.STRING, "nuc1", groupId="hardware")
 pc.defineParameter("enb1_node", "Node for eNB1", portal.ParameterType.STRING, "nuc2", groupId="hardware")
-pc.defineParameter("enbfake_node", "Node for fake eNB", portal.ParameterType.STRING, "nuc4", groupId="hardware")
-pc.defineParameter("ue_node", "Node for UE", portal.ParameterType.STRING, "nuc1", groupId="hardware")
+pc.defineParameter("enb2_node", "Node for eNB2", portal.ParameterType.STRING, "nuc4", groupId="hardware")
+pc.defineParameter("ue_node", "Node for UE", portal.ParameterType.STRING, "nuc3", groupId="hardware")
 # Network Configuration
+pc.defineParameter("link_enbs", "Create link between eNodeBs", portal.ParameterType.BOOLEAN, False,
+    longDescription="Create an optional network link between the two eNodeBs (enb1 and enb2) for X2 interface or other inter-eNodeB communication.",
+    groupId="networking")
 pc.defineParameter("shared_vlan", "Shared VLAN name (for remote O-RAN only)", portal.ParameterType.STRING, "", 
     longDescription="Name of an existing shared VLAN to connect to remote O-RAN experiment. Only used when 'Deploy O-RAN RIC on eNodeB' is disabled. Leave empty if using local O-RAN or no O-RAN integration.",
     groupId="networking")
@@ -307,6 +315,15 @@ def next_ipv4_addr(base_addr_str, mask_str, offset):
             mask_str, base_addr_str, offset))
     return socket.inet_ntoa(struct.pack(">i", ni))
 
+def add_epc_services(epc):
+    """
+    Adds services for EPC node.
+    """
+    epc.addService(rspec.Execute(shell="bash", command="/local/repository/bin/tune-cpu.sh"))
+    epc.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-srslte.sh"))
+    if params.install_vnc:
+        epc.startVNC()
+
 def add_ue_services(ue, ue_index):
     """
     Adds services for UE nodes following srslte-shvlan-oran pattern.
@@ -352,10 +369,12 @@ def add_services(node, role):
     """
     Legacy function for backward compatibility - redirects to specific service functions.
     """
-    if role == "UE":
+    if role == "EPC":
+        add_epc_services(node)
+    elif role == "UE":
         add_ue_services(node, 1)
-    elif role in ["eNodeB", "Fake eNodeB"]:
-        add_enb_services(node, 1 if role == "eNodeB" else 2)
+    elif role in ["eNodeB1", "eNodeB2"]:
+        add_enb_services(node, 1 if role == "eNodeB1" else 2)
 
 def create_node(name, component_id, role):
     """
@@ -395,6 +414,16 @@ def connect_shared_vlan(node, vlan_name, ip_address, netmask):
         link.best_effort = True
 
 # ======== SETUP NODES ========
+# Setup optional EPC node
+if params.deploy_epc_node:
+    epc = request.RawPC("epc")
+    epc.hardware_type = GLOBALS.NUC_HWTYPE
+    epc.component_id = params.epc_node
+    epc.disk_image = GLOBALS.SRSLTE_IMG
+    add_epc_services(epc)
+    epc_enb1_iface = create_interface(epc, "epc_enb1", "10.20.20.1")
+    epc_enb2_iface = create_interface(epc, "epc_enb2", "10.20.21.1")
+
 # Setup UE node
 ue = request.RawPC("ue")
 ue.hardware_type = GLOBALS.NUC_HWTYPE
@@ -403,7 +432,7 @@ ue.disk_image = GLOBALS.SRSLTE_IMG
 ue.Desire("rf-controlled", 1)
 add_ue_services(ue, 1)
 ue_enb1_rf = create_interface(ue, "ue_enb1_rf")
-ue_enb_fake_rf = create_interface(ue, "ue_enb_fake_rf")
+ue_enb2_rf = create_interface(ue, "ue_enb2_rf")
 
 # Setup first eNodeB
 enb1 = request.RawPC("enb1")
@@ -413,35 +442,68 @@ enb1.disk_image = GLOBALS.SRSLTE_IMG
 enb1.Desire("rf-controlled", 1)
 add_enb_services(enb1, 1)
 enb1_ue_rf = create_interface(enb1, "enb1_ue_rf")
+if params.deploy_epc_node:
+    enb1_epc_iface = create_interface(enb1, "enb1_epc", "10.20.20.2")
+if params.link_enbs:
+    enb1_to_enb2 = create_interface(enb1, "enb1_to_enb2", "10.10.10.1")
 
-# Setup fake eNodeB
-enb_fake = request.RawPC("fake_enb")
-enb_fake.hardware_type = GLOBALS.NUC_HWTYPE
-enb_fake.component_id = params.enbfake_node
-enb_fake.disk_image = GLOBALS.SRSLTE_IMG
-enb_fake.Desire("rf-controlled", 1)
-add_enb_services(enb_fake, 2)
-enb_fake_ue_rf = create_interface(enb_fake, "enb_fake_ue_rf")
+# Setup second eNodeB
+enb2 = request.RawPC("enb2")
+enb2.hardware_type = GLOBALS.NUC_HWTYPE
+enb2.component_id = params.enb2_node
+enb2.disk_image = GLOBALS.SRSLTE_IMG
+enb2.Desire("rf-controlled", 1)
+add_enb_services(enb2, 2)
+enb2_ue_rf = create_interface(enb2, "enb2_ue_rf")
+if params.deploy_epc_node:
+    enb2_epc_iface = create_interface(enb2, "enb2_epc", "10.20.21.2")
+if params.link_enbs:
+    enb2_to_enb1 = create_interface(enb2, "enb2_to_enb1", "10.10.10.2")
 
 # ======== SETUP NETWORK LINKS ========
-# Create RF links
+# Create RF links between eNodeBs and UE
 rflink1 = request.RFLink("rflink1")
 rflink1.addInterface(enb1_ue_rf)
 rflink1.addInterface(ue_enb1_rf)
 
-rflink_fake = request.RFLink("rflink_fake")
-rflink_fake.addInterface(enb_fake_ue_rf)
-rflink_fake.addInterface(ue_enb_fake_rf)
+rflink2 = request.RFLink("rflink2")
+rflink2.addInterface(enb2_ue_rf)
+rflink2.addInterface(ue_enb2_rf)
+
+# Create links between EPC and eNodeBs (S1 interface)
+if params.deploy_epc_node:
+    epc_enb1_link = request.Link("epc_enb1_link")
+    epc_enb1_link.addInterface(epc_enb1_iface)
+    epc_enb1_link.addInterface(enb1_epc_iface)
+    if params.multiplex_lans:
+        epc_enb1_link.link_multiplexing = True
+        epc_enb1_link.best_effort = True
+    
+    epc_enb2_link = request.Link("epc_enb2_link")
+    epc_enb2_link.addInterface(epc_enb2_iface)
+    epc_enb2_link.addInterface(enb2_epc_iface)
+    if params.multiplex_lans:
+        epc_enb2_link.link_multiplexing = True
+        epc_enb2_link.best_effort = True
+
+# Create optional link between eNodeBs (for X2 interface or inter-eNB communication)
+if params.link_enbs:
+    enb_link = request.Link("enb_link")
+    enb_link.addInterface(enb1_to_enb2)
+    enb_link.addInterface(enb2_to_enb1)
+    if params.multiplex_lans:
+        enb_link.link_multiplexing = True
+        enb_link.best_effort = True
 
 # Create shared VLAN only for remote O-RAN integration (not needed for local RIC)
 if params.shared_vlan and not params.deploy_oran_locally:
     # Calculate IP addresses for each node using O-RAN address as base
     enb1_ip = next_ipv4_addr(params.oran_address, params.shared_vlan_netmask, 1)
-    fake_enb_ip = next_ipv4_addr(params.oran_address, params.shared_vlan_netmask, 2)
+    enb2_ip = next_ipv4_addr(params.oran_address, params.shared_vlan_netmask, 2)
     
     # Connect nodes to shared VLAN
     connect_shared_vlan(enb1, params.shared_vlan, enb1_ip, params.shared_vlan_netmask)
-    connect_shared_vlan(enb_fake, params.shared_vlan, fake_enb_ip, params.shared_vlan_netmask)
+    connect_shared_vlan(enb2, params.shared_vlan, enb2_ip, params.shared_vlan_netmask)
 
 # ======== TOUR INFORMATION ========
 tour = IG.Tour()
