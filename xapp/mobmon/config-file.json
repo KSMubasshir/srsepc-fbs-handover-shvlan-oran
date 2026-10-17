@@ -1,0 +1,65 @@
+{
+  "xapp_name": "mobmon",
+  "version": "0.1.0",
+  "containers": [
+    {
+      "name": "mobmon",
+      "image": {
+        "registry": "10.10.1.1:5000",
+        "name": "mobmon",
+        "tag": "0.1.0"
+      }
+    }
+  ],
+  "messaging": {
+    "ports": [
+      {
+        "name": "http",
+        "container": "mobmon",
+        "port": 8080,
+        "description": "RIC xApp REST API (health, subscription notifications, /mobmon/v1/reports)"
+      },
+      {
+        "name": "rmr-data",
+        "container": "mobmon",
+        "port": 4560,
+        "rxMessages": [
+          "RIC_SUB_RESP",
+          "RIC_SUB_FAILURE",
+          "RIC_INDICATION",
+          "RIC_SUB_DEL_RESP",
+          "RIC_SUB_DEL_FAILURE"
+        ],
+        "txMessages": [
+          "RIC_SUB_REQ",
+          "RIC_SUB_DEL_REQ"
+        ],
+        "policies": [],
+        "description": "rmr receive data port for mobmon"
+      },
+      {
+        "name": "rmr-route",
+        "container": "mobmon",
+        "port": 4561,
+        "description": "rmr route port for mobmon"
+      }
+    ]
+  },
+  "rmr": {
+    "protPort": "tcp:4560",
+    "maxSize": 65536,
+    "numWorkers": 1,
+    "rxMessages": [
+      "RIC_SUB_RESP",
+      "RIC_SUB_FAILURE",
+      "RIC_INDICATION",
+      "RIC_SUB_DEL_RESP",
+      "RIC_SUB_DEL_FAILURE"
+    ],
+    "txMessages": [
+      "RIC_SUB_REQ",
+      "RIC_SUB_DEL_REQ"
+    ],
+    "policies": []
+  }
+}

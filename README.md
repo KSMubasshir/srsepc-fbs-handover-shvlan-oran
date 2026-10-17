@@ -51,14 +51,15 @@ This POWDER profile deploys an LTE testbed with two eNodeBs for S1 handover expe
    /local/setup/oran/dms_cli onboard /local/profile-public/nexran-config-file.json /local/setup/oran/xapp-embedded-schema.json
    /local/setup/oran/dms_cli install nexran 0.1.0 ricxapp
    ```
-3. Copy [bin/ric-trace.sh](bin/ric-trace.sh) to the RIC node and run `ric-trace.sh start`; note the run id.
-4. Start the RAN with that run id, in order:
+3. For handover KPIs at the RIC, copy [xapp/mobmon](xapp/mobmon) and [bin/deploy-mobmon.sh](bin/deploy-mobmon.sh) to the RIC node and run `deploy-mobmon.sh mobmon` (see [Handover KPIs at the RIC](#handover-kpis-at-the-ric-e2sm-mob)).
+4. Copy [bin/ric-trace.sh](bin/ric-trace.sh) to the RIC node and run `ric-trace.sh start`; note the run id.
+5. Start the RAN with that run id, in order:
    ```bash
    /local/repository/bin/ran-run.sh start enb <run-id>   # enb1 (starts the core too), then enb2
    /local/repository/bin/ran-run.sh start ue <run-id>    # ue: srsue + ping to the core gateway
    ```
-5. Drive handover with the attenuators (`/local/repository/bin/atten -l` lists the path ids), register nodes with NexRAN, etc.
-6. Stop: `ran-run.sh stop <role> <run-id>` on each node, `ric-trace.sh stop` on the RIC. Bundles land in `/local/logs/e2run/`.
+6. Drive handover with the attenuators (`/local/repository/bin/atten -l` lists the path ids), register nodes with NexRAN, etc. Each path has several attenuator ids (e.g. `1,33,2,34:nuc2/nuc1`); set all of them, or the cell is not isolated.
+7. Stop: `ran-run.sh stop <role> <run-id>` on each node, `ric-trace.sh stop` on the RIC. Bundles land in `/local/logs/e2run/`.
 
 ### What gets captured
 
@@ -70,6 +71,22 @@ This POWDER profile deploys an LTE testbed with two eNodeBs for S1 handover expe
 | UE | `ue_mac.pcap`, `ue.log`, `ue.out`, `ping.out` |
 
 Wireshark: *Decode As → SCTP port 32222 → E2AP* for the E2 captures.
+
+## Handover KPIs at the RIC (E2SM-MOB)
+
+The stock srslte-ric service models report no handover information (KPM has per-UE radio and traffic metrics only). [setup-srslte.sh](bin/setup-srslte.sh) pins srslte-ric and applies [patches/srslte-ric/0001-e2sm-mob-handover-kpis.patch](patches/srslte-ric/0001-e2sm-mob-handover-kpis.patch), which adds a service model **ORAN-E2SM-MOB** (OID `1.3.6.1.4.1.53148.1.1.2.102`, RAN function id 4; ASN.1 in [xapp/mobmon/e2sm-mob-v01.00.asn1](xapp/mobmon/e2sm-mob-v01.00.asn1)). Each periodic indication carries:
+
+- **Cumulative counters**: S1 handover as source (attempt, preparation success/failure, success, failure), as target (the same), intra-eNB handover, RRC re-establishment (attempt, success, reject), measurement reports. Source-side success is a UE context release with cause *successful-handover*; failure is a re-establishment or any other release after the HO command.
+- **Per UE**: RNTI, RRC state, handover state (idle, source preparation/execution, target preparation/execution, intra-eNB), serving PCI, and the last MeasurementReport (serving and neighbour PCI/RSRP/RSRQ, age).
+- **Events** since the subscription's previous report: handover start/preparation outcome/outcome and re-establishment request/success/reject, with eNB timestamps, RNTI, source/target PCI and ECI, serving/target RSRP at the decision, duration since the handover started, and re-establishment cause.
+
+The **mobmon** xApp ([xapp/mobmon](xapp/mobmon), deployed with [bin/deploy-mobmon.sh](bin/deploy-mobmon.sh)) subscribes on every connected eNB (1 s period by default, `PERIOD_MS`) and logs one JSON line per indication (`"kind": "report"`, with derived success rates) and per event (`"kind": "event"`), so `ric-trace.sh` captures them as `xapp-ricxapp-mobmon-*.log`:
+
+```bash
+grep '"event"' xapp-ricxapp-mobmon-*.log | jq -c '{meid, seq, type, rnti, sourcePci, targetPci, durationMs, servingRsrpDbm, targetRsrpDbm}'
+```
+
+The latest report per eNB is also at `GET /mobmon/v1/reports` on the mobmon pod (port 8080).
 
 ## Scripts
 
@@ -84,6 +101,7 @@ Wireshark: *Decode As → SCTP port 32222 → E2AP* for the E2 captures.
 | [bin/update-ue-config-files.sh](bin/update-ue-config-files.sh) | ue | UE identity (Milenage), frequency, gains |
 | [bin/ran-run.sh](bin/ran-run.sh) | all RAN nodes | Start/stop a run and collect traces |
 | [bin/ric-trace.sh](bin/ric-trace.sh) | RIC node | E2 capture + RIC log collection |
+| [bin/deploy-mobmon.sh](bin/deploy-mobmon.sh) | RIC node | Build and deploy the mobmon handover KPI xApp |
 | [bin/start-enb.sh](bin/start-enb.sh), [bin/start-ue.sh](bin/start-ue.sh) | enbs, ue | Shortcuts for `ran-run.sh start` + tmux attach |
 | [bin/setup-ip-config.sh](bin/setup-ip-config.sh) | enbs | Routes for `shared_vlan` mode |
 | [bin/setup-oran-local.sh](bin/setup-oran-local.sh) | enb1 | Local RIC (`local` mode) |

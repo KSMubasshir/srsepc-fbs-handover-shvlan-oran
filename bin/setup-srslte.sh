@@ -35,6 +35,12 @@ $SUDO apt-get install -y \
 
 git clone https://gitlab.flux.utah.edu/powderrenewpublic/srslte-ric
 cd srslte-ric
+# Pin the revision our patches apply to, then add the E2SM-MOB handover KPI
+# service model (see patches/srslte-ric/).
+git checkout f628088f4d023b4cbeb14afa9c18be4a068e50e9 || exit 1
+for p in $SETUPDIR/../patches/srslte-ric/*.patch; do
+    git apply $p || exit 1
+done
 mkdir -p build
 cd build
 cmake ../ \

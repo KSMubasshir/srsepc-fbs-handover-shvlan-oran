@@ -1,0 +1,1635 @@
+From bde857fdf1e6095d65c035bb463312f67b46eda3 Mon Sep 17 00:00:00 2001
+From: KSMubasshir <ksmubasshir@gmail.com>
+Date: Sat, 17 Oct 2026 00:24:01 -0400
+Subject: [PATCH] Add E2SM-MOB service model reporting handover KPIs over E2
+
+The RIC agent's models expose no handover information: KPM carries
+per-UE radio and traffic metrics only, and nothing reports measurement
+reports or S1/intra-eNB handover outcomes.
+
+RRC now keeps cumulative handover counters (S1 source/target attempt,
+preparation success/failure, execution success/failure; intra-eNB;
+re-establishment; measurement reports), each UE's handover state and
+last MeasurementReport, and a log of the latest 64 handover and
+re-establishment events, exported through rrc_metrics_t.  The source
+side counts success when the MME releases the context with cause
+successful-handover, which S1AP now passes to RRC.
+
+The new ORAN-E2SM-MOB model (OID 1.3.6.1.4.1.53148.1.1.2.102, RAN
+function 4, after the existing ones) sends these as periodic
+indications; each subscription gets the events since its previous
+report.  Its ASN.1 is in-tree and generated at build time like
+NexRAN's.  Build option ENABLE_RIC_AGENT_MOB (default ON).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                                |   5 +
+ .../srslte/interfaces/enb_interfaces.h        |   3 +
+ srsenb/hdr/ric/e2sm_mob.h                     |  47 +++
+ srsenb/hdr/stack/rrc/rrc.h                    |   3 +
+ srsenb/hdr/stack/rrc/rrc_metrics.h            | 118 +++++-
+ srsenb/hdr/stack/rrc/rrc_mobility.h           |  42 +-
+ srsenb/hdr/stack/rrc/rrc_mobility_stats.h     |  63 +++
+ srsenb/hdr/stack/rrc/rrc_ue.h                 |   1 +
+ srsenb/src/ric/CMakeLists.txt                 |  32 ++
+ srsenb/src/ric/agent.cc                       |  15 +
+ srsenb/src/ric/e2sm_mob.cc                    | 399 ++++++++++++++++++
+ .../ric/messages/asn1/e2sm-mob-v01.00.asn1    | 232 ++++++++++
+ srsenb/src/stack/rrc/rrc.cc                   |  24 +-
+ srsenb/src/stack/rrc/rrc_mobility.cc          | 251 ++++++++++-
+ srsenb/src/stack/rrc/rrc_ue.cc                |  21 +
+ srsenb/src/stack/upper/s1ap.cc                |   5 +
+ 16 files changed, 1239 insertions(+), 22 deletions(-)
+ create mode 100644 srsenb/hdr/ric/e2sm_mob.h
+ create mode 100644 srsenb/hdr/stack/rrc/rrc_mobility_stats.h
+ create mode 100644 srsenb/src/ric/e2sm_mob.cc
+ create mode 100644 srsenb/src/ric/messages/asn1/e2sm-mob-v01.00.asn1
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 414dda58b..5bde1aae5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -104,11 +104,16 @@ option(ENABLE_RIC_AGENT_KPM    "Enable RIC E2 Agent KPM metrics"  ON)
+ option(ENABLE_RIC_AGENT_NEXRAN "Enable RIC E2 Agent NexRAN model" ON)
+ option(ENABLE_SLICER           "Enable NexRAN Slicer"             ON)
+ option(ENABLE_ZYLINIUM         "Enable Zylinium E2 service model" ON)
++option(ENABLE_RIC_AGENT_MOB    "Enable RIC E2 Agent mobility (handover KPI) model" ON)
+ 
+ if(ENABLE_RIC_AGENT)
+   add_definitions(-DENABLE_RIC_AGENT)
+ else()
+   set(ENABLE_RIC_AGENT_KPM OFF)
++  set(ENABLE_RIC_AGENT_MOB OFF)
++endif()
++if(ENABLE_RIC_AGENT_MOB)
++  add_definitions(-DENABLE_RIC_AGENT_MOB)
+ endif()
+ if(ENABLE_RIC_AGENT_KPM)
+   add_definitions(-DENABLE_RIC_AGENT_KPM)
+diff --git a/lib/include/srslte/interfaces/enb_interfaces.h b/lib/include/srslte/interfaces/enb_interfaces.h
+index 2d06bd6ca..8b7f1e504 100644
+--- a/lib/include/srslte/interfaces/enb_interfaces.h
++++ b/lib/include/srslte/interfaces/enb_interfaces.h
+@@ -450,6 +450,9 @@ public:
+                start_ho_ue_resource_alloc(const asn1::s1ap::ho_request_s&                                   msg,
+                                           const asn1::s1ap::sourceenb_to_targetenb_transparent_container_s& container) = 0;
+   virtual void set_erab_status(uint16_t rnti, const asn1::s1ap::bearers_subject_to_status_transfer_list_l& erabs) = 0;
++  /// The MME is releasing the UE context with cause successful-handover (source side of an S1 handover).
++  /// Called before release_complete().
++  virtual void ho_release_successful(uint16_t rnti) {}
+ };
+ 
+ // GTPU interface for PDCP
+diff --git a/srsenb/hdr/ric/e2sm_mob.h b/srsenb/hdr/ric/e2sm_mob.h
+new file mode 100644
+index 000000000..6313d0608
+--- /dev/null
++++ b/srsenb/hdr/ric/e2sm_mob.h
+@@ -0,0 +1,47 @@
++#ifndef RIC_E2SM_MOB_H
++#define RIC_E2SM_MOB_H
++
++#include <list>
++
++#include "pthread.h"
++
++#include "srsenb/hdr/ric/e2ap.h"
++#include "srsenb/hdr/ric/e2sm.h"
++#include "srsenb/hdr/ric/timer_queue.h"
++
++namespace ric {
++
++/**
++ * E2SM-MOB: periodic reports of handover counters, per-UE handover state and
++ * last measurement report, and the handover/re-establishment events since the
++ * previous report of each subscription.
++ */
++class mob_model : public service_model
++{
++public:
++  typedef struct subscription_model_data {
++    long     period;
++    int      timer_id;
++    uint32_t next_seq; ///< first event seq not yet reported to this subscription
++  } subscription_model_data_t;
++
++  mob_model(ric::agent *agent_);
++  int init();
++  void stop();
++  virtual ~mob_model() { stop(); };
++  static void *timer_callback(int timer_id,void *arg);
++  void send_indications(int timer_id);
++  int handle_subscription_add(ric::subscription_t *sub);
++  int handle_subscription_del(ric::subscription_t *sub,int force,
++			      long *cause,long *cause_detail);
++
++private:
++  pthread_mutex_t lock;
++  long serial_number;
++  std::list<ric::subscription_t *> subscriptions;
++  timer_queue queue;
++};
++
++}
++
++#endif
+diff --git a/srsenb/hdr/stack/rrc/rrc.h b/srsenb/hdr/stack/rrc/rrc.h
+index cc8c74a41..09c662868 100644
+--- a/srsenb/hdr/stack/rrc/rrc.h
++++ b/srsenb/hdr/stack/rrc/rrc.h
+@@ -25,6 +25,7 @@
+ #include "rrc_bearer_cfg.h"
+ #include "rrc_cell_cfg.h"
+ #include "rrc_metrics.h"
++#include "rrc_mobility_stats.h"
+ #include "srsenb/hdr/stack/upper/common_enb.h"
+ #include "srslte/common/block_queue.h"
+ #include "srslte/common/buffer_pool.h"
+@@ -92,6 +93,7 @@ public:
+        start_ho_ue_resource_alloc(const asn1::s1ap::ho_request_s&                                   msg,
+                                   const asn1::s1ap::sourceenb_to_targetenb_transparent_container_s& container) override;
+   void set_erab_status(uint16_t rnti, const asn1::s1ap::bearers_subject_to_status_transfer_list_l& erabs) override;
++  void ho_release_successful(uint16_t rnti) override;
+ 
+   // rrc_interface_pdcp
+   void write_pdu(uint16_t rnti, uint32_t lcid, srslte::unique_byte_buffer_t pdu) override;
+@@ -148,6 +150,7 @@ private:
+   std::unique_ptr<freq_res_common_list>          pucch_res_list;
+   std::map<uint16_t, std::unique_ptr<ue> >       users; // NOTE: has to have fixed addr
+   std::map<uint32_t, asn1::rrc::paging_record_s> pending_paging;
++  rrc_mobility_stats                             mob_stats;
+ 
+   void     process_release_complete(uint16_t rnti);
+   void     rem_user(uint16_t rnti);
+diff --git a/srsenb/hdr/stack/rrc/rrc_metrics.h b/srsenb/hdr/stack/rrc/rrc_metrics.h
+index 55c64084c..931e324a6 100644
+--- a/srsenb/hdr/stack/rrc/rrc_metrics.h
++++ b/srsenb/hdr/stack/rrc/rrc_metrics.h
+@@ -39,16 +39,122 @@ typedef enum {
+   RRC_STATE_N_ITEMS,
+ } rrc_state_t;
+ 
++/// Handover state of a UE context, as seen by this eNB.
++enum class rrc_ue_mob_state_t : uint8_t {
++  idle = 0,       ///< no handover in progress
++  s1_source_prep, ///< source: HandoverRequired sent, waiting for HandoverCommand
++  s1_source_exec, ///< source: HO command sent to the UE, waiting for release
++  s1_target_prep, ///< target: HandoverRequest handled, waiting for MME status transfer
++  s1_target_exec, ///< target: waiting for RRCConnectionReconfigurationComplete
++  intra_enb,      ///< intra-eNB handover in progress
++};
++
++/// One cell of a MeasurementReport.  rsrp/rsrq are the TS 36.133 report values
++/// (RSRP 0..97 ~ value-140 dBm, RSRQ 0..34 ~ value/2-20 dB).
++struct rrc_meas_cell_t {
++  uint16_t pci;
++  bool     rsrp_present;
++  uint8_t  rsrp;
++  bool     rsrq_present;
++  uint8_t  rsrq;
++};
++
++#define RRC_MEAS_MAX_NEIGH_CELLS 8
++
++/// Last MeasurementReport received from a UE.
++struct rrc_ue_meas_t {
++  bool            valid;
++  uint64_t        time_ms; ///< wall-clock reception time
++  uint32_t        n_reports;
++  uint8_t         meas_id;
++  rrc_meas_cell_t serving;
++  uint32_t        n_neigh;
++  rrc_meas_cell_t neigh[RRC_MEAS_MAX_NEIGH_CELLS];
++};
++
++/// Cumulative handover counters of this eNB since start.
++struct rrc_ho_counters_t {
++  // S1 handover with this eNB as source
++  uint32_t s1_out_attempt;      ///< HandoverRequired sent
++  uint32_t s1_out_prep_success; ///< HandoverCommand received and sent to the UE
++  uint32_t s1_out_prep_failure; ///< HandoverPreparationFailure, TS1RELOCprep expiry, or local error
++  uint32_t s1_out_success;      ///< UE context released by the MME with cause successful-handover
++  uint32_t s1_out_failure;      ///< UE re-established or was released otherwise after the HO command
++  // S1 handover with this eNB as target
++  uint32_t s1_in_attempt;      ///< HandoverRequest received
++  uint32_t s1_in_prep_success; ///< HandoverRequestAcknowledge sent
++  uint32_t s1_in_prep_failure; ///< HandoverRequest could not be admitted
++  uint32_t s1_in_success;      ///< RRCConnectionReconfigurationComplete received from the UE
++  uint32_t s1_in_failure;      ///< UE context removed before the UE arrived
++  // intra-eNB handover
++  uint32_t intra_attempt;
++  uint32_t intra_success;
++  uint32_t intra_failure;
++  // RRC connection re-establishment
++  uint32_t reest_attempt; ///< RRCConnectionReestablishmentRequest received
++  uint32_t reest_success; ///< RRCConnectionReestablishmentComplete received
++  uint32_t reest_reject;  ///< RRCConnectionReestablishmentReject or RRCConnectionReject sent
++  uint32_t meas_reports;
++};
++
++enum class rrc_ho_event_type_t : uint8_t {
++  s1_out_prep_start = 0,
++  s1_out_prep_success,
++  s1_out_prep_failure,
++  s1_out_success,
++  s1_out_failure,
++  s1_in_request,
++  s1_in_prep_success,
++  s1_in_prep_failure,
++  s1_in_success,
++  s1_in_failure,
++  intra_start,
++  intra_success,
++  intra_failure,
++  reest_request,
++  reest_success,
++  reest_reject,
++};
++
++#define RRC_INVALID_PCI 0xffff
++#define RRC_INVALID_MEAS 0xff
++
++/// A handover or re-establishment event.  Optional fields use RRC_INVALID_*.
++struct rrc_ho_event_t {
++  uint32_t            seq; ///< 1, 2, ... in order of occurrence
++  uint64_t            time_ms;
++  rrc_ho_event_type_t type;
++  uint16_t            rnti;
++  uint16_t            source_pci;
++  uint16_t            target_pci;
++  uint32_t            target_eci;   ///< 0 if unknown
++  uint8_t             serving_rsrp; ///< at the handover decision
++  uint8_t             target_rsrp;  ///< at the handover decision
++  uint32_t            duration_ms;  ///< outcome events: time since the handover started
++  int8_t              reest_cause;  ///< reest_request: 36.331 ReestablishmentCause, -1 otherwise
++};
++
++#define RRC_HO_EVENT_LOG_SIZE 64
++
++struct rrc_mobility_metrics_t {
++  rrc_ho_counters_t counters;
++  uint32_t          next_seq; ///< seq the next event will get
++  uint32_t          n_events; ///< events[0..n_events) hold the latest events, oldest first
++  rrc_ho_event_t    events[RRC_HO_EVENT_LOG_SIZE];
++};
++
+ struct rrc_ue_metrics_t {
+-  rrc_state_t state;
+-#ifdef ENABLE_RIC_AGENT_KPM
+-  uint16_t    rnti;
+-#endif
++  rrc_state_t        state;
++  uint16_t           rnti;
++  uint16_t           pci; ///< PCell PCI
++  rrc_ue_mob_state_t mob_state;
++  rrc_ue_meas_t      meas;
+ };
+ 
+ struct rrc_metrics_t {
+-  uint16_t         n_ues;
+-  rrc_ue_metrics_t ues[ENB_METRICS_MAX_USERS];
++  uint16_t               n_ues;
++  rrc_ue_metrics_t       ues[ENB_METRICS_MAX_USERS];
++  rrc_mobility_metrics_t mobility;
+ };
+ 
+ } // namespace srsenb
+diff --git a/srsenb/hdr/stack/rrc/rrc_mobility.h b/srsenb/hdr/stack/rrc/rrc_mobility.h
+index 17355490e..89a34aa2c 100644
+--- a/srsenb/hdr/stack/rrc/rrc_mobility.h
++++ b/srsenb/hdr/stack/rrc/rrc_mobility.h
+@@ -102,7 +102,33 @@ public:
+   start_ho_ue_resource_alloc(const asn1::s1ap::ho_request_s&                                   msg,
+                              const asn1::s1ap::sourceenb_to_targetenb_transparent_container_s& container);
+ 
++  // Mobility metrics
++  /// Close the handover in progress, if any, before the UE context is removed.  successful_ho: the MME released
++  /// the context with cause successful-handover.
++  void                 handle_ue_release(bool successful_ho);
++  rrc_ue_mob_state_t   get_mob_state() const;
++  const rrc_ue_meas_t& get_last_meas() const { return last_meas; }
++  uint16_t             pcell_pci() const;
++
+ private:
++  /// Handover in progress, for the mobility counters and events.
++  struct ho_ctxt_t {
++    enum kind_t { none, s1_out, s1_in, intra } kind = none;
++    bool     exec       = false; ///< HO command sent to the UE (out, intra) / HandoverRequestAcknowledge sent (in)
++    uint64_t start_ms   = 0;
++    uint16_t source_pci = RRC_INVALID_PCI;
++    uint16_t target_pci = RRC_INVALID_PCI;
++    uint32_t target_eci = 0;
++  };
++  void ho_start(ho_ctxt_t::kind_t kind, uint16_t source_pci, uint16_t target_pci, uint32_t target_eci,
++                uint8_t target_rsrp);
++  void ho_exec();
++  void ho_finish(bool success);
++  void record_meas_report(const asn1::rrc::meas_results_s& meas_res);
++
++  ho_ctxt_t     ho_ctxt;
++  rrc_ue_meas_t last_meas = {};
++
+   // helper methods
+   bool update_ue_var_meas_cfg(uint32_t                src_earfcn,
+                               const cell_info_common& target_pcell,
+@@ -129,8 +155,10 @@ private:
+ 
+   // events
+   struct ho_meas_report_ev {
+-    uint32_t                                target_eci = 0;
+-    const asn1::rrc::meas_obj_to_add_mod_s* meas_obj   = nullptr;
++    uint32_t                                target_eci  = 0;
++    const asn1::rrc::meas_obj_to_add_mod_s* meas_obj    = nullptr;
++    uint16_t                                target_pci  = RRC_INVALID_PCI;
++    uint8_t                                 target_rsrp = RRC_INVALID_MEAS;
+   };
+   struct ho_req_rx_ev {
+     const asn1::s1ap::ho_request_s*                                   ho_req_msg;
+@@ -141,7 +169,15 @@ private:
+   using status_transfer_ev      = asn1::s1ap::bearers_subject_to_status_transfer_list_l;
+ 
+   // states
+-  struct idle_st {};
++  struct idle_st {
++    // Every return to idle that an outcome handler has not already recorded
++    // (failure_ev, ho_cancel_ev from any handover state) is a failed handover.
++    template <typename Ev>
++    void enter(rrc_mobility* f, const Ev& ev)
++    {
++      f->ho_finish(false);
++    }
++  };
+   struct intraenb_ho_st {
+     const cell_info_common* target_cell     = nullptr;
+     const cell_info_common* source_cell     = nullptr;
+diff --git a/srsenb/hdr/stack/rrc/rrc_mobility_stats.h b/srsenb/hdr/stack/rrc/rrc_mobility_stats.h
+new file mode 100644
+index 000000000..840d1421e
+--- /dev/null
++++ b/srsenb/hdr/stack/rrc/rrc_mobility_stats.h
+@@ -0,0 +1,63 @@
++#ifndef SRSENB_RRC_MOBILITY_STATS_H
++#define SRSENB_RRC_MOBILITY_STATS_H
++
++#include "rrc_metrics.h"
++#include <algorithm>
++#include <sys/time.h>
++
++namespace srsenb {
++
++inline uint64_t rrc_wallclock_ms()
++{
++  struct timeval tv;
++  gettimeofday(&tv, nullptr);
++  return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
++}
++
++/**
++ * Handover counters and a log of the latest handover/re-establishment events
++ * of one eNB.  Only touched from the stack thread (RRC, S1AP and metrics
++ * queries all run there).
++ */
++class rrc_mobility_stats
++{
++public:
++  rrc_ho_counters_t counters = {};
++
++  /// Append an event stamped with the next sequence number and the current
++  /// time; the caller fills in the remaining fields.
++  rrc_ho_event_t& add_event(rrc_ho_event_type_t type, uint16_t rnti)
++  {
++    rrc_ho_event_t& ev = events[(next_seq - 1) % RRC_HO_EVENT_LOG_SIZE];
++    ev                 = {};
++    ev.seq             = next_seq++;
++    ev.time_ms         = rrc_wallclock_ms();
++    ev.type            = type;
++    ev.rnti            = rnti;
++    ev.source_pci      = RRC_INVALID_PCI;
++    ev.target_pci      = RRC_INVALID_PCI;
++    ev.serving_rsrp    = RRC_INVALID_MEAS;
++    ev.target_rsrp     = RRC_INVALID_MEAS;
++    ev.reest_cause     = -1;
++    return ev;
++  }
++
++  void get_metrics(rrc_mobility_metrics_t& m) const
++  {
++    m.counters = counters;
++    m.next_seq = next_seq;
++    m.n_events = std::min<uint32_t>(next_seq - 1, RRC_HO_EVENT_LOG_SIZE);
++    uint32_t first = next_seq - m.n_events;
++    for (uint32_t i = 0; i < m.n_events; i++) {
++      m.events[i] = events[(first + i - 1) % RRC_HO_EVENT_LOG_SIZE];
++    }
++  }
++
++private:
++  rrc_ho_event_t events[RRC_HO_EVENT_LOG_SIZE] = {};
++  uint32_t       next_seq                       = 1;
++};
++
++} // namespace srsenb
++
++#endif // SRSENB_RRC_MOBILITY_STATS_H
+diff --git a/srsenb/hdr/stack/rrc/rrc_ue.h b/srsenb/hdr/stack/rrc/rrc_ue.h
+index 9aa75625a..60e8b1c38 100644
+--- a/srsenb/hdr/stack/rrc/rrc_ue.h
++++ b/srsenb/hdr/stack/rrc/rrc_ue.h
+@@ -53,6 +53,7 @@ public:
+   void send_connection_reject();
+   void send_connection_release();
+   void send_connection_reest_rej();
++  void record_reest_reject();
+   void send_connection_reconf(srslte::unique_byte_buffer_t sdu);
+   void send_connection_reconf_new_bearer();
+   void send_connection_reconf_upd(srslte::unique_byte_buffer_t pdu);
+diff --git a/srsenb/src/ric/CMakeLists.txt b/srsenb/src/ric/CMakeLists.txt
+index 3136f7621..ca9413731 100644
+--- a/srsenb/src/ric/CMakeLists.txt
++++ b/srsenb/src/ric/CMakeLists.txt
+@@ -139,6 +139,28 @@ if("${RIC_GENERATED_E2SM_ZYLINIUM_BINDING_DIR}" STREQUAL "")
+ endif()
+ endif()
+ 
++if(ENABLE_RIC_AGENT_MOB)
++if("${RIC_GENERATED_E2SM_MOB_BINDING_DIR}" STREQUAL "")
++  set(E2SM_MOB_ASN_FILE ${RIC_ASN_DIR}/e2sm-mob-v01.00.asn1)
++  set(E2SM_MOB_C_DIR ${CMAKE_CURRENT_BINARY_DIR}/messages/E2SM-MOB/)
++  execute_process(
++    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/make_asn1c_includes.sh "${E2SM_MOB_C_DIR}" "${E2SM_MOB_ASN_FILE}" "E2SM_MOB_" -fno-include-deps -fincludes-quoted
++    RESULT_VARIABLE ret)
++  if (NOT ${ret} STREQUAL 0)
++    message(FATAL_ERROR "${ret}: error")
++  endif (NOT ${ret} STREQUAL 0)
++else()
++  set(E2SM_MOB_C_DIR "${RIC_GENERATED_E2SM_MOB_BINDING_DIR}")
++endif()
++file(GLOB E2SM_MOB_source ${E2SM_MOB_C_DIR}/*.c)
++if("${RIC_GENERATED_E2SM_MOB_BINDING_DIR}" STREQUAL "")
++  add_custom_command (
++    OUTPUT ${E2SM_MOB_source}
++    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/make_asn1c_includes.sh "${E2SM_MOB_C_DIR}" "${E2SM_MOB_ASN_FILE}" "E2SM_MOB_" -fno-include-deps -fincludes-quoted
++    DEPENDS ${E2SM_MOB_ASN_FILE})
++endif()
++endif()
++
+ set(RIC_SOURCES
+   ${E2AP_source}
+   ${E2SM_GNB_NRT_source}
+@@ -172,6 +194,13 @@ set(RIC_SOURCES
+   e2sm_zylinium.cc)
+ endif()
+ 
++if(ENABLE_RIC_AGENT_MOB)
++set(RIC_SOURCES
++  ${RIC_SOURCES}
++  ${E2SM_MOB_source}
++  e2sm_mob.cc)
++endif()
++
+ add_library(srsenb_ric STATIC ${RIC_SOURCES})
+ target_include_directories(srsenb_ric BEFORE PUBLIC ${E2SM_GNB_NRT_C_DIR})
+ if(ENABLE_RIC_AGENT_KPM)
+@@ -183,4 +212,7 @@ endif()
+ if(ENABLE_ZYLINIUM)
+   target_include_directories(srsenb_ric BEFORE PUBLIC ${E2SM_ZYLINIUM_C_DIR})
+ endif()
++if(ENABLE_RIC_AGENT_MOB)
++  target_include_directories(srsenb_ric BEFORE PUBLIC ${E2SM_MOB_C_DIR})
++endif()
+ target_include_directories(srsenb_ric BEFORE PUBLIC ${E2AP_C_DIR})
+diff --git a/srsenb/src/ric/agent.cc b/srsenb/src/ric/agent.cc
+index 169e40a20..9e08b04f4 100644
+--- a/srsenb/src/ric/agent.cc
++++ b/srsenb/src/ric/agent.cc
+@@ -32,6 +32,9 @@
+ #ifdef ENABLE_ZYLINIUM
+ #include "srsenb/hdr/ric/e2sm_zylinium.h"
+ #endif
++#ifdef ENABLE_RIC_AGENT_MOB
++#include "srsenb/hdr/ric/e2sm_mob.h"
++#endif
+ 
+ namespace ric {
+ 
+@@ -175,6 +178,18 @@ int agent::init(const srsenb::all_args_t& args_,
+   service_models.push_back(model);
+   RIC_INFO("added model %s\n",model->name.c_str());
+ 
++  // Added last so the RAN function IDs of the models above do not change.
++#ifdef ENABLE_RIC_AGENT_MOB
++  model = new mob_model(this);
++  if (model->init()) {
++    RIC_ERROR("failed to add E2SM-MOB model; aborting!\n");
++    delete model;
++    return SRSLTE_ERROR;
++  }
++  service_models.push_back(model);
++  RIC_INFO("added model %s\n",model->name.c_str());
++#endif
++
+   /* Construct a simple function_id->function lookup table. */
+   for (it = service_models.begin(); it != service_models.end(); ++it) {
+     for (it2 = (*it)->functions.begin(); it2 != (*it)->functions.end(); ++it2) {
+diff --git a/srsenb/src/ric/e2sm_mob.cc b/srsenb/src/ric/e2sm_mob.cc
+new file mode 100644
+index 000000000..3f1b28862
+--- /dev/null
++++ b/srsenb/src/ric/e2sm_mob.cc
+@@ -0,0 +1,399 @@
++
++#include <sys/time.h>
++
++#include "srslte/interfaces/enb_metrics_interface.h"
++#include "srsenb/hdr/stack/rrc/rrc_metrics.h"
++#include "srsenb/hdr/stack/rrc/rrc_mobility_stats.h"
++#include "srsenb/hdr/ric/e2ap.h"
++#include "srsenb/hdr/ric/e2sm.h"
++#include "srsenb/hdr/ric/agent.h"
++#include "srsenb/hdr/ric/agent_asn1.h"
++#include "srsenb/hdr/ric/e2sm_mob.h"
++#include "srsenb/hdr/ric/e2ap_encode.h"
++#include "srsenb/hdr/ric/e2ap_decode.h"
++#include "srsenb/hdr/ric/e2ap_generate.h"
++
++#include "E2AP_RICactionType.h"
++#include "E2AP_RICindicationType.h"
++#include "E2SM_MOB_RANfunction-Description.h"
++#include "E2SM_MOB_E2SM-Mob-EventTriggerDefinition.h"
++#include "E2SM_MOB_E2SM-Mob-IndicationHeader.h"
++#include "E2SM_MOB_E2SM-Mob-IndicationMessage.h"
++#include "E2SM_MOB_CellInfo.h"
++#include "E2SM_MOB_UeMobilityStatus.h"
++#include "E2SM_MOB_UeMeasReport.h"
++#include "E2SM_MOB_MeasResult.h"
++#include "E2SM_MOB_HoEvent.h"
++
++namespace ric {
++
++mob_model::mob_model(ric::agent *agent_) :
++  service_model(agent_,"ORAN-E2SM-MOB","1.3.6.1.4.1.53148.1.1.2.102"),
++  serial_number(1), lock(PTHREAD_MUTEX_INITIALIZER)
++{
++}
++
++int mob_model::init()
++{
++  ric::ran_function_t *func;
++  E2SM_MOB_RANfunction_Description_t *func_def;
++
++  E2SM_INFO(agent,"mob: building function list\n");
++
++  func = (ric::ran_function_t *)calloc(1,sizeof(*func));
++  func->function_id = get_next_ran_function_id();
++  func->model = this;
++  func->revision = 0;
++  func->name = "ORAN-E2SM-MOB";
++  func->description = "Handover KPIs and events";
++
++  func_def = (E2SM_MOB_RANfunction_Description_t *)calloc(1,sizeof(*func_def));
++  func_def->ranFunction_Name.ranFunction_ShortName.buf = \
++    (uint8_t *)strdup(func->name.c_str());
++  func_def->ranFunction_Name.ranFunction_ShortName.size = \
++    strlen(func->name.c_str());
++  func_def->ranFunction_Name.ranFunction_E2SM_OID.buf = \
++    (uint8_t *)strdup(func->model->oid.c_str());
++  func_def->ranFunction_Name.ranFunction_E2SM_OID.size = \
++    strlen(func->model->oid.c_str());
++  func_def->ranFunction_Name.ranFunction_Description.buf = \
++    (uint8_t *)strdup(func->description.c_str());
++  func_def->ranFunction_Name.ranFunction_Description.size = \
++    strlen(func->description.c_str());
++
++  func->enc_definition_len = ric::e2ap::encode(
++    &asn_DEF_E2SM_MOB_RANfunction_Description,0,
++    func_def,&func->enc_definition);
++  if (func->enc_definition_len < 0) {
++    E2SM_ERROR(agent,"failed to encode %s function %s!\n",
++	       name.c_str(),func->name.c_str());
++    ASN_STRUCT_FREE(asn_DEF_E2SM_MOB_RANfunction_Description,func_def);
++    free(func);
++    return -1;
++  }
++
++  func->enabled = 1;
++  func->definition = func_def;
++  functions.push_back(func);
++
++  queue.start();
++
++  return 0;
++}
++
++void mob_model::stop()
++{
++  pthread_mutex_lock(&lock);
++  queue.stop();
++  for (auto it = subscriptions.begin(); it != subscriptions.end(); ++it) {
++    delete (subscription_model_data_t *)(*it)->model_data;
++    (*it)->model_data = NULL;
++  }
++  subscriptions.clear();
++  pthread_mutex_unlock(&lock);
++}
++
++int mob_model::handle_subscription_add(ric::subscription_t *sub)
++{
++  E2SM_MOB_E2SM_Mob_EventTriggerDefinition_t etdef;
++  bool any_actions_enabled = false;
++  subscription_model_data_t *md;
++  struct timeval tv;
++
++  if (sub->event_trigger.size < 1 || sub->event_trigger.buf == NULL) {
++    E2SM_ERROR(agent,"mob: no report event trigger\n");
++    return -1;
++  }
++
++  memset(&etdef,0,sizeof(etdef));
++  if (ric::e2ap::decode(
++	agent,&asn_DEF_E2SM_MOB_E2SM_Mob_EventTriggerDefinition,&etdef,
++	sub->event_trigger.buf,sub->event_trigger.size)) {
++    E2SM_ERROR(agent,"mob: failed to decode event trigger definition\n");
++    ASN_STRUCT_FREE_CONTENTS_ONLY(
++      asn_DEF_E2SM_MOB_E2SM_Mob_EventTriggerDefinition,&etdef);
++    return -1;
++  }
++  if (etdef.present != E2SM_MOB_E2SM_Mob_EventTriggerDefinition_PR_periodDefinition) {
++    E2SM_ERROR(agent,"mob: unrecognized event trigger definition\n");
++    ASN_STRUCT_FREE_CONTENTS_ONLY(
++      asn_DEF_E2SM_MOB_E2SM_Mob_EventTriggerDefinition,&etdef);
++    return -1;
++  }
++  long period = etdef.choice.periodDefinition.period;
++  ASN_STRUCT_FREE_CONTENTS_ONLY(
++    asn_DEF_E2SM_MOB_E2SM_Mob_EventTriggerDefinition,&etdef);
++
++  for (auto it = sub->actions.begin(); it != sub->actions.end(); ++it) {
++    ric::action_t *action = *it;
++    if (action->type != E2AP_RICactionType_report) {
++      E2SM_WARN(agent,"mob: invalid actionType %ld; not enabling this action\n",
++		action->type);
++      continue;
++    }
++    action->enabled = true;
++    any_actions_enabled = true;
++  }
++  if (!any_actions_enabled) {
++    E2SM_ERROR(agent,"mob: no actions enabled; failing subscription\n");
++    return -1;
++  }
++
++  // Start with whatever is still in the eNB's event log.
++  md = new subscription_model_data_t{period,-1,1};
++
++  pthread_mutex_lock(&lock);
++  subscriptions.push_back(sub);
++  tv = { md->period / 1000, (md->period % 1000) * 1000 };
++  md->timer_id = queue.insert_periodic(tv,timer_callback,this);
++  sub->model_data = md;
++  pthread_mutex_unlock(&lock);
++
++  E2SM_INFO(agent,"mob: added subscription (reqid=%ld,instid=%ld) period %ld ms\n",
++	    sub->request_id,sub->instance_id,period);
++
++  return 0;
++}
++
++int mob_model::handle_subscription_del(
++  ric::subscription_t *sub,int force,long *cause,long *cause_detail)
++{
++  subscription_model_data_t *md = (subscription_model_data_t *)sub->model_data;
++
++  pthread_mutex_lock(&lock);
++  if (md) {
++    queue.cancel(md->timer_id);
++    delete md;
++  }
++  sub->model_data = NULL;
++  subscriptions.remove(sub);
++  pthread_mutex_unlock(&lock);
++
++  return 0;
++}
++
++void *mob_model::timer_callback(int timer_id,void *arg)
++{
++  mob_model *model = (mob_model *)arg;
++  model->agent->push_task([model,timer_id]() { model->send_indications(timer_id); });
++  return NULL;
++}
++
++template <typename T>
++static T *new_opt(long value)
++{
++  T *p = (T *)calloc(1,sizeof(T));
++  *p = value;
++  return p;
++}
++
++static void fill_meas_result(E2SM_MOB_MeasResult_t *mr,const srsenb::rrc_meas_cell_t &c)
++{
++  mr->pci = c.pci;
++  if (c.rsrp_present)
++    mr->rsrp = new_opt<E2SM_MOB_RSRP_t>(c.rsrp);
++  if (c.rsrq_present)
++    mr->rsrq = new_opt<E2SM_MOB_RSRQ_t>(c.rsrq);
++}
++
++static void fill_ue_list(E2SM_MOB_MobilityReport_t *report,
++			 const srsenb::rrc_metrics_t &rm,uint64_t now_ms)
++{
++  for (uint16_t i = 0; i < rm.n_ues && i < ENB_METRICS_MAX_USERS; ++i) {
++    const srsenb::rrc_ue_metrics_t &um = rm.ues[i];
++    E2SM_MOB_UeMobilityStatus_t *ue = \
++      (E2SM_MOB_UeMobilityStatus_t *)calloc(1,sizeof(*ue));
++    ue->rnti = um.rnti;
++    ue->rrcState = um.state;
++    ue->mobilityState = (long)um.mob_state;
++    if (um.pci != RRC_INVALID_PCI)
++      ue->servingPci = new_opt<E2SM_MOB_PCI_t>(um.pci);
++    if (um.meas.valid) {
++      E2SM_MOB_UeMeasReport_t *mrep = \
++	(E2SM_MOB_UeMeasReport_t *)calloc(1,sizeof(*mrep));
++      mrep->ageMs = now_ms > um.meas.time_ms ? now_ms - um.meas.time_ms : 0;
++      mrep->nReports = um.meas.n_reports;
++      mrep->measId = um.meas.meas_id;
++      fill_meas_result(&mrep->serving,um.meas.serving);
++      for (uint32_t j = 0; j < um.meas.n_neigh && j < RRC_MEAS_MAX_NEIGH_CELLS; ++j) {
++	E2SM_MOB_MeasResult_t *mr = (E2SM_MOB_MeasResult_t *)calloc(1,sizeof(*mr));
++	fill_meas_result(mr,um.meas.neigh[j]);
++	ASN_SEQUENCE_ADD(&mrep->neighbours.list,mr);
++      }
++      ue->lastMeasReport = mrep;
++    }
++    ASN_SEQUENCE_ADD(&report->ueList.list,ue);
++  }
++}
++
++/// Add the events with seq >= next_seq; return the seq after the last one.
++static uint32_t fill_event_list(E2SM_MOB_MobilityReport_t *report,
++				const srsenb::rrc_mobility_metrics_t &mm,
++				uint32_t next_seq)
++{
++  uint32_t oldest = mm.next_seq - mm.n_events;
++  if (next_seq < oldest) {
++    report->eventsLost = oldest - next_seq;
++    next_seq = oldest;
++  }
++  for (uint32_t i = next_seq - oldest; i < mm.n_events; ++i) {
++    const srsenb::rrc_ho_event_t &e = mm.events[i];
++    E2SM_MOB_HoEvent_t *ev = (E2SM_MOB_HoEvent_t *)calloc(1,sizeof(*ev));
++    ev->seq = e.seq;
++    ev->timestampSec = e.time_ms / 1000;
++    ev->timestampMs = e.time_ms % 1000;
++    ev->eventType = (long)e.type;
++    if (e.rnti != SRSLTE_INVALID_RNTI)
++      ev->rnti = new_opt<E2SM_MOB_C_RNTI_t>(e.rnti);
++    if (e.source_pci != RRC_INVALID_PCI)
++      ev->sourcePci = new_opt<E2SM_MOB_PCI_t>(e.source_pci);
++    if (e.target_pci != RRC_INVALID_PCI)
++      ev->targetPci = new_opt<E2SM_MOB_PCI_t>(e.target_pci);
++    if (e.target_eci != 0)
++      ev->targetEci = new_opt<E2SM_MOB_ECI_t>(e.target_eci);
++    if (e.serving_rsrp != RRC_INVALID_MEAS)
++      ev->servingRsrp = new_opt<E2SM_MOB_RSRP_t>(e.serving_rsrp);
++    if (e.target_rsrp != RRC_INVALID_MEAS)
++      ev->targetRsrp = new_opt<E2SM_MOB_RSRP_t>(e.target_rsrp);
++    switch (e.type) {
++    case srsenb::rrc_ho_event_type_t::s1_out_prep_start:
++    case srsenb::rrc_ho_event_type_t::s1_in_request:
++    case srsenb::rrc_ho_event_type_t::intra_start:
++    case srsenb::rrc_ho_event_type_t::reest_request:
++    case srsenb::rrc_ho_event_type_t::reest_success:
++    case srsenb::rrc_ho_event_type_t::reest_reject:
++      break;
++    default:
++      ev->durationMs = new_opt<E2SM_MOB_Counter_t>(e.duration_ms);
++    }
++    // 36.331 ReestablishmentCause: reconfigurationFailure, handoverFailure, otherFailure, spare
++    if (e.reest_cause >= 0 && e.reest_cause <= 2)
++      ev->reestCause = new_opt<E2SM_MOB_ReestCause_t>(e.reest_cause);
++    ASN_SEQUENCE_ADD(&report->eventList.list,ev);
++  }
++  return mm.next_seq;
++}
++
++void mob_model::send_indications(int timer_id)
++{
++  ric::subscription_t *sub = NULL;
++  subscription_model_data_t *md = NULL;
++  E2SM_MOB_E2SM_Mob_IndicationHeader_t ih;
++  E2SM_MOB_E2SM_Mob_IndicationMessage_t im;
++  uint8_t *header_buf = NULL;
++  ssize_t header_buf_len = 0;
++  uint8_t *msg_buf = NULL;
++  ssize_t msg_buf_len = 0;
++  uint32_t next_seq;
++
++  pthread_mutex_lock(&lock);
++
++  for (auto it = subscriptions.begin(); it != subscriptions.end(); ++it) {
++    subscription_model_data_t *d = (subscription_model_data_t *)(*it)->model_data;
++    if (d && d->timer_id == timer_id) {
++      sub = *it;
++      md = d;
++      break;
++    }
++  }
++  if (sub == NULL) {
++    E2SM_ERROR(agent,"mob: bogus timer_id %d; ignoring!\n",timer_id);
++    pthread_mutex_unlock(&lock);
++    return;
++  }
++
++  // enb_metrics_t is large; keep it off the agent thread's stack.
++  std::unique_ptr<srsenb::enb_metrics_t> em(new srsenb::enb_metrics_t{});
++  agent->enb_metrics_interface->get_metrics(em.get());
++  const srsenb::rrc_metrics_t &rm = em->stack.rrc;
++  uint64_t now_ms = srsenb::rrc_wallclock_ms();
++
++  memset(&ih,0,sizeof(ih));
++  ih.timestampSec = now_ms / 1000;
++  ih.timestampMs = now_ms % 1000;
++  ih.enbId = agent->rrc_cfg.enb_id;
++
++  memset(&im,0,sizeof(im));
++  im.present = E2SM_MOB_E2SM_Mob_IndicationMessage_PR_mobilityReport;
++  E2SM_MOB_MobilityReport_t *report = &im.choice.mobilityReport;
++
++  for (const auto &cell : agent->rrc_cfg.cell_list) {
++    E2SM_MOB_CellInfo_t *ci = (E2SM_MOB_CellInfo_t *)calloc(1,sizeof(*ci));
++    ci->cellId = cell.cell_id;
++    ci->pci = cell.pci;
++    ci->dlEarfcn = cell.dl_earfcn;
++    ASN_SEQUENCE_ADD(&report->cellList.list,ci);
++  }
++
++  const srsenb::rrc_ho_counters_t &c = rm.mobility.counters;
++  report->counters.s1OutAttempt = c.s1_out_attempt;
++  report->counters.s1OutPrepSuccess = c.s1_out_prep_success;
++  report->counters.s1OutPrepFailure = c.s1_out_prep_failure;
++  report->counters.s1OutSuccess = c.s1_out_success;
++  report->counters.s1OutFailure = c.s1_out_failure;
++  report->counters.s1InAttempt = c.s1_in_attempt;
++  report->counters.s1InPrepSuccess = c.s1_in_prep_success;
++  report->counters.s1InPrepFailure = c.s1_in_prep_failure;
++  report->counters.s1InSuccess = c.s1_in_success;
++  report->counters.s1InFailure = c.s1_in_failure;
++  report->counters.intraAttempt = c.intra_attempt;
++  report->counters.intraSuccess = c.intra_success;
++  report->counters.intraFailure = c.intra_failure;
++  report->counters.reestAttempt = c.reest_attempt;
++  report->counters.reestSuccess = c.reest_success;
++  report->counters.reestReject = c.reest_reject;
++  report->counters.measReports = c.meas_reports;
++
++  fill_ue_list(report,rm,now_ms);
++  next_seq = fill_event_list(report,rm.mobility,md->next_seq);
++
++  E2SM_DEBUG(agent,"mob indication header:\n");
++  E2SM_XER_PRINT(NULL,&asn_DEF_E2SM_MOB_E2SM_Mob_IndicationHeader,&ih);
++  E2SM_DEBUG(agent,"mob indication message:\n");
++  E2SM_XER_PRINT(NULL,&asn_DEF_E2SM_MOB_E2SM_Mob_IndicationMessage,&im);
++
++  header_buf_len = ric::e2ap::encode(
++    &asn_DEF_E2SM_MOB_E2SM_Mob_IndicationHeader,0,&ih,&header_buf);
++  if (header_buf_len < 0) {
++    E2SM_ERROR(agent,"mob: failed to encode indication header\n");
++    goto out;
++  }
++  msg_buf_len = ric::e2ap::encode(
++    &asn_DEF_E2SM_MOB_E2SM_Mob_IndicationMessage,0,&im,&msg_buf);
++  if (msg_buf_len < 0) {
++    E2SM_ERROR(agent,"mob: failed to encode indication message\n");
++    goto out;
++  }
++
++  for (auto it = sub->actions.begin(); it != sub->actions.end(); ++it) {
++    ric::action_t *action = *it;
++    uint8_t *buf = NULL;
++    ssize_t buf_len = 0;
++
++    if (!action->enabled)
++      continue;
++    if (ric::e2ap::generate_indication(
++	  agent,sub->request_id,sub->instance_id,sub->function_id,
++	  action->id,serial_number++,(int)E2AP_RICindicationType_report,
++	  header_buf,header_buf_len,msg_buf,msg_buf_len,NULL,0,&buf,&buf_len)) {
++      E2SM_ERROR(agent,"mob: failed to generate indication (reqid=%ld,instid=%ld,funcid=%ld,actid=%ld)\n",
++		 sub->request_id,sub->instance_id,sub->function_id,action->id);
++      continue;
++    }
++    E2SM_DEBUG(agent,"mob: sending indication (reqid=%ld,instid=%ld,funcid=%ld,actid=%ld)\n",
++	       sub->request_id,sub->instance_id,sub->function_id,action->id);
++    agent->send_sctp_data(buf,buf_len);
++    free(buf);
++  }
++  // Only advance once the events have been sent.
++  md->next_seq = next_seq;
++
++ out:
++  ASN_STRUCT_FREE_CONTENTS_ONLY(asn_DEF_E2SM_MOB_E2SM_Mob_IndicationHeader,&ih);
++  ASN_STRUCT_FREE_CONTENTS_ONLY(asn_DEF_E2SM_MOB_E2SM_Mob_IndicationMessage,&im);
++  free(header_buf);
++  free(msg_buf);
++  pthread_mutex_unlock(&lock);
++}
++
++}
+diff --git a/srsenb/src/ric/messages/asn1/e2sm-mob-v01.00.asn1 b/srsenb/src/ric/messages/asn1/e2sm-mob-v01.00.asn1
+new file mode 100644
+index 000000000..9bf29ae0b
+--- /dev/null
++++ b/srsenb/src/ric/messages/asn1/e2sm-mob-v01.00.asn1
+@@ -0,0 +1,232 @@
++-- **************************************************************
++-- E2SM-MOB
++-- Mobility (handover) reporting service model
++--
++-- Periodic reports of an eNB's handover counters, per-UE handover
++-- state and last measurement report, and a log of handover and
++-- RRC re-establishment events.
++--
++-- Measurement values are TS 36.133 report mappings:
++--   RSRP 0..97 ~ (value - 140) dBm, RSRQ 0..34 ~ (value / 2 - 20) dB.
++-- **************************************************************
++
++E2SM-MOB-IEs {
++iso(1) identified-organization(3) dod(6) internet(1) private(4) enterprise(1) 53148 e2(1) version1 (1) e2sm(2) e2sm-MOB-IEs (102)}
++
++DEFINITIONS AUTOMATIC TAGS ::=
++
++BEGIN
++
++maxOfCells INTEGER ::= 16
++maxOfUes INTEGER ::= 256
++maxOfNeighCells INTEGER ::= 8
++maxOfEvents INTEGER ::= 64
++
++Counter ::= INTEGER (0..4294967295)
++TimeSec ::= INTEGER (0..4294967295)
++TimeMs ::= INTEGER (0..999)
++C-RNTI ::= INTEGER (0..65535)
++PCI ::= INTEGER (0..503)
++ECI ::= INTEGER (0..268435455)
++RSRP ::= INTEGER (0..97)
++RSRQ ::= INTEGER (0..34)
++
++-- **************************************************************
++-- RAN Function Description
++-- **************************************************************
++
++RANfunction-Name ::= SEQUENCE {
++    ranFunction-ShortName   PrintableString(SIZE(1..150,...)),
++    ranFunction-E2SM-OID    PrintableString(SIZE(1..1000,...)),
++    ranFunction-Description PrintableString(SIZE(1..150,...)),
++    ranFunction-Instance    INTEGER OPTIONAL,
++    ...
++}
++
++RANfunction-Description ::= SEQUENCE {
++    ranFunction-Name RANfunction-Name,
++    ...
++}
++
++-- **************************************************************
++-- Event Trigger and Action Definitions
++-- **************************************************************
++
++E2SM-Mob-EventTriggerDefinition ::= CHOICE {
++    periodDefinition E2SM-Mob-EventTriggerDefinition-Period,
++    ...
++}
++
++E2SM-Mob-EventTriggerDefinition-Period ::= SEQUENCE {
++    period INTEGER (10..10240),
++    ...
++}
++
++E2SM-Mob-ActionType ::= ENUMERATED {
++    mobilityReport,
++    ...
++}
++
++E2SM-Mob-ActionDefinition ::= SEQUENCE {
++    actionType E2SM-Mob-ActionType,
++    ...
++}
++
++-- **************************************************************
++-- Report contents
++-- **************************************************************
++
++CellInfo ::= SEQUENCE {
++    cellId   INTEGER (0..255),
++    pci      PCI,
++    dlEarfcn INTEGER (0..262143),
++    ...
++}
++
++HoCounters ::= SEQUENCE {
++    -- S1 handover, this eNB as source
++    s1OutAttempt     Counter,
++    s1OutPrepSuccess Counter,
++    s1OutPrepFailure Counter,
++    s1OutSuccess     Counter,
++    s1OutFailure     Counter,
++    -- S1 handover, this eNB as target
++    s1InAttempt      Counter,
++    s1InPrepSuccess  Counter,
++    s1InPrepFailure  Counter,
++    s1InSuccess      Counter,
++    s1InFailure      Counter,
++    -- intra-eNB handover
++    intraAttempt     Counter,
++    intraSuccess     Counter,
++    intraFailure     Counter,
++    -- RRC connection re-establishment
++    reestAttempt     Counter,
++    reestSuccess     Counter,
++    reestReject      Counter,
++    measReports      Counter,
++    ...
++}
++
++MeasResult ::= SEQUENCE {
++    pci  PCI,
++    rsrp RSRP OPTIONAL,
++    rsrq RSRQ OPTIONAL,
++    ...
++}
++
++UeMeasReport ::= SEQUENCE {
++    ageMs      Counter,
++    nReports   Counter,
++    measId     INTEGER (1..32),
++    serving    MeasResult,
++    neighbours SEQUENCE (SIZE(0..maxOfNeighCells)) OF MeasResult,
++    ...
++}
++
++RrcState ::= ENUMERATED {
++    idle,
++    waitConSetupComplete,
++    waitConReestComplete,
++    waitSecurityModeComplete,
++    waitUeCapInfo,
++    waitConReconfComplete,
++    reestablishmentComplete,
++    registered,
++    releaseRequest,
++    ...
++}
++
++MobilityState ::= ENUMERATED {
++    idle,
++    s1SourcePreparation,
++    s1SourceExecution,
++    s1TargetPreparation,
++    s1TargetExecution,
++    intraEnb,
++    ...
++}
++
++UeMobilityStatus ::= SEQUENCE {
++    rnti           C-RNTI,
++    rrcState       RrcState,
++    mobilityState  MobilityState,
++    servingPci     PCI OPTIONAL,
++    lastMeasReport UeMeasReport OPTIONAL,
++    ...
++}
++
++HoEventType ::= ENUMERATED {
++    s1OutPrepStart,
++    s1OutPrepSuccess,
++    s1OutPrepFailure,
++    s1OutSuccess,
++    s1OutFailure,
++    s1InRequest,
++    s1InPrepSuccess,
++    s1InPrepFailure,
++    s1InSuccess,
++    s1InFailure,
++    intraStart,
++    intraSuccess,
++    intraFailure,
++    reestRequest,
++    reestSuccess,
++    reestReject,
++    ...
++}
++
++ReestCause ::= ENUMERATED {
++    reconfigurationFailure,
++    handoverFailure,
++    otherFailure,
++    ...
++}
++
++HoEvent ::= SEQUENCE {
++    seq          Counter,
++    timestampSec TimeSec,
++    timestampMs  TimeMs,
++    eventType    HoEventType,
++    rnti         C-RNTI OPTIONAL,
++    sourcePci    PCI OPTIONAL,
++    targetPci    PCI OPTIONAL,
++    targetEci    ECI OPTIONAL,
++    -- at the handover decision (start events)
++    servingRsrp  RSRP OPTIONAL,
++    targetRsrp   RSRP OPTIONAL,
++    -- outcome events: time since the handover started
++    durationMs   Counter OPTIONAL,
++    reestCause   ReestCause OPTIONAL,
++    ...
++}
++
++MobilityReport ::= SEQUENCE {
++    cellList    SEQUENCE (SIZE(0..maxOfCells)) OF CellInfo,
++    counters    HoCounters,
++    ueList      SEQUENCE (SIZE(0..maxOfUes)) OF UeMobilityStatus,
++    -- events since the previous report of this subscription, oldest first
++    eventList   SEQUENCE (SIZE(0..maxOfEvents)) OF HoEvent,
++    -- events that occurred since the previous report but were dropped
++    -- from the eNB's event log before they could be reported
++    eventsLost  Counter,
++    ...
++}
++
++-- **************************************************************
++-- Indication Header and Message
++-- **************************************************************
++
++E2SM-Mob-IndicationHeader ::= SEQUENCE {
++    timestampSec TimeSec,
++    timestampMs  TimeMs,
++    enbId        INTEGER (0..1048575),
++    ...
++}
++
++E2SM-Mob-IndicationMessage ::= CHOICE {
++    mobilityReport MobilityReport,
++    ...
++}
++
++END
+diff --git a/srsenb/src/stack/rrc/rrc.cc b/srsenb/src/stack/rrc/rrc.cc
+index 8199e16cf..08b016cc4 100644
+--- a/srsenb/src/stack/rrc/rrc.cc
++++ b/srsenb/src/stack/rrc/rrc.cc
+@@ -112,12 +112,23 @@ void rrc::get_metrics(rrc_metrics_t& m)
+   if (running) {
+     m.n_ues = 0;
+     for (auto iter = users.begin(); m.n_ues < ENB_METRICS_MAX_USERS && iter != users.end(); ++iter) {
+-      ue* u                  = iter->second.get();
+-#ifdef ENABLE_RIC_AGENT_KPM
+-      m.ues[m.n_ues].rnti = u->rnti;
+-#endif
+-      m.ues[m.n_ues++].state = u->get_state();
++      ue*               u  = iter->second.get();
++      rrc_ue_metrics_t& um = m.ues[m.n_ues++];
++      um.rnti              = u->rnti;
++      um.state             = u->get_state();
++      um.pci               = u->mobility_handler->pcell_pci();
++      um.mob_state         = u->mobility_handler->get_mob_state();
++      um.meas              = u->mobility_handler->get_last_meas();
+     }
++    mob_stats.get_metrics(m.mobility);
++  }
++}
++
++void rrc::ho_release_successful(uint16_t rnti)
++{
++  auto user_it = users.find(rnti);
++  if (user_it != users.end()) {
++    user_it->second->mobility_handler->handle_ue_release(true);
+   }
+ }
+ 
+@@ -562,6 +573,9 @@ void rrc::rem_user(uint16_t rnti)
+     srslte::console("Disconnecting rnti=0x%x.\n", rnti);
+     rrc_log->info("Disconnecting rnti=0x%x.\n", rnti);
+ 
++    // A handover still open at this point did not complete.
++    user_it->second->mobility_handler->handle_ue_release(false);
++
+     /* First remove MAC and GTPU to stop processing DL/UL traffic for this user
+      */
+     mac->ue_rem(rnti); // MAC handles PHY
+diff --git a/srsenb/src/stack/rrc/rrc_mobility.cc b/srsenb/src/stack/rrc/rrc_mobility.cc
+index b87c78d48..ea56484c5 100644
+--- a/srsenb/src/stack/rrc/rrc_mobility.cc
++++ b/srsenb/src/stack/rrc/rrc_mobility.cc
+@@ -22,6 +22,7 @@
+ #include "srsenb/hdr/stack/rrc/rrc_mobility.h"
+ #include "srsenb/hdr/stack/rrc/mac_controller.h"
+ #include "srsenb/hdr/stack/rrc/rrc_cell_cfg.h"
++#include "srslte/adt/scope_exit.h"
+ #include "srslte/asn1/rrc_asn1_utils.h"
+ #include "srslte/common/bcd_helpers.h"
+ #include "srslte/common/common.h"
+@@ -517,8 +518,19 @@ uint16_t rrc::start_ho_ue_resource_alloc(const asn1::s1ap::ho_request_s&
+   /* Evaluate if cell exists */
+   uint32_t                target_eci  = container.target_cell_id.cell_id.to_number();
+   const cell_info_common* target_cell = cell_common_list->get_cell_id(rrc_details::eci_to_cellid(target_eci));
++  // The UE context (and its handover metrics) only exists once the C-RNTI is allocated.
++  auto record_alloc_failure = [this, target_eci, target_cell]() {
++    mob_stats.counters.s1_in_attempt++;
++    mob_stats.counters.s1_in_prep_failure++;
++    rrc_ho_event_t& ev = mob_stats.add_event(rrc_ho_event_type_t::s1_in_prep_failure, SRSLTE_INVALID_RNTI);
++    ev.target_eci      = target_eci;
++    if (target_cell != nullptr) {
++      ev.target_pci = target_cell->cell_cfg.pci;
++    }
++  };
+   if (target_cell == nullptr) {
+     rrc_log->error("The S1-handover target cell_id=0x%x does not exist\n", rrc_details::eci_to_cellid(target_eci));
++    record_alloc_failure();
+     return SRSLTE_INVALID_RNTI;
+   }
+ 
+@@ -534,6 +546,7 @@ uint16_t rrc::start_ho_ue_resource_alloc(const asn1::s1ap::ho_request_s&
+   uint16_t rnti                          = mac->reserve_new_crnti(ue_cfg);
+   if (rnti == SRSLTE_INVALID_RNTI) {
+     rrc_log->error("Failed to allocate C-RNTI resources\n");
++    record_alloc_failure();
+     return SRSLTE_INVALID_RNTI;
+   }
+ 
+@@ -589,6 +602,7 @@ bool rrc::ue::rrc_mobility::fill_conn_recfg_no_ho_cmd(asn1::rrc::rrc_conn_recfg_
+ //! Method called whenever the eNB receives a MeasReport from the UE. In normal situations, an HO procedure is started
+ void rrc::ue::rrc_mobility::handle_ue_meas_report(const meas_report_s& msg)
+ {
++  record_meas_report(msg.crit_exts.c1().meas_report_r8().meas_results);
+   if (not is_in_state<idle_st>()) {
+     Info("Received a MeasReport while UE is performing Handover. Ignoring...\n");
+     return;
+@@ -631,6 +645,8 @@ void rrc::ue::rrc_mobility::handle_ue_meas_report(const meas_report_s& msg)
+       rrc_log->warning("The PCI=%d inside the MeasReport is not recognized.\n", e.pci);
+       continue;
+     }
++    meas_ev.target_pci  = e.pci;
++    meas_ev.target_rsrp = e.meas_result.rsrp_result_present ? e.meas_result.rsrp_result : RRC_INVALID_MEAS;
+ 
+     // eNB found the respective cell. eNB takes "HO Decision"
+     // NOTE: From now we just choose the strongest.
+@@ -1020,6 +1036,13 @@ void rrc::ue::rrc_mobility::s1_source_ho_st::wait_ho_req_ack_st::enter(s1_source
+       "Starting S1 Handover of rnti=0x%x to cellid=0x%x.\n", f->parent_fsm()->rrc_ue->rnti, ev.target_eci);
+   f->report = ev;
+ 
++  rrc_mobility* mob = f->parent_fsm();
++  mob->ho_start(ho_ctxt_t::s1_out,
++                mob->pcell_pci(),
++                ev.target_pci,
++                ev.target_eci,
++                ev.target_rsrp);
++
+   bool success = f->parent_fsm()->start_ho_preparation(f->report.target_eci, f->report.meas_obj->meas_obj_id, false);
+   if (not success) {
+     f->trigger(srslte::failure_ev{});
+@@ -1060,6 +1083,7 @@ void rrc::ue::rrc_mobility::s1_source_ho_st::send_ho_cmd(wait_ho_req_ack_st& s,
+     trigger(ho_cancel_ev{});
+     return;
+   }
++  parent_fsm()->ho_exec();
+ }
+ 
+ //! Called in Source ENB during S1-Handover when there was a Reestablishment Request
+@@ -1091,14 +1115,32 @@ void rrc::ue::rrc_mobility::handle_ho_req(idle_st& s, const ho_req_rx_ev& ho_req
+   /* TS 36.331 10.2.2. - Decode HandoverPreparationInformation */
+   asn1::cbit_ref            bref{rrc_container.data(), rrc_container.size()};
+   asn1::rrc::ho_prep_info_s hoprep;
+-  if (hoprep.unpack(bref) != asn1::SRSASN_SUCCESS) {
+-    rrc_enb->rrc_log->error("Failed to decode HandoverPreparationinformation in S1AP SourceENBToTargetENBContainer\n");
+-    trigger(srslte::failure_ev{});
+-    return;
+-  }
+-  if (hoprep.crit_exts.type().value != c1_or_crit_ext_opts::c1 or
+-      hoprep.crit_exts.c1().type().value != ho_prep_info_s::crit_exts_c_::c1_c_::types_opts::ho_prep_info_r8) {
+-    rrc_enb->rrc_log->error("Only release 8 supported\n");
++  bool                      hoprep_ok =
++      hoprep.unpack(bref) == asn1::SRSASN_SUCCESS and hoprep.crit_exts.type().value == c1_or_crit_ext_opts::c1 and
++      hoprep.crit_exts.c1().type().value == ho_prep_info_s::crit_exts_c_::c1_c_::types_opts::ho_prep_info_r8;
++
++  const cell_info_common* own_cell   = rrc_ue->get_ue_cc_cfg(UE_PCELL_CC_IDX);
++  uint16_t                source_pci = RRC_INVALID_PCI;
++  if (hoprep_ok and hoprep.crit_exts.c1().ho_prep_info_r8().as_context_present and
++      hoprep.crit_exts.c1().ho_prep_info_r8().as_context.reest_info_present) {
++    source_pci = hoprep.crit_exts.c1().ho_prep_info_r8().as_context.reest_info.source_pci;
++  }
++  ho_start(ho_ctxt_t::s1_in,
++           source_pci,
++           pcell_pci(),
++           own_cell != nullptr ? (rrc_enb->cfg.enb_id << 8u) + own_cell->cell_cfg.cell_id : 0,
++           RRC_INVALID_MEAS);
++  // failure_ev triggered here is not handled (this runs before the transition out of idle_st), so record
++  // the outcome explicitly.
++  auto record_failure = srslte::make_scope_exit([this]() {
++    if (not ho_ctxt.exec) {
++      ho_finish(false);
++    }
++  });
++
++  if (not hoprep_ok) {
++    rrc_enb->rrc_log->error("Failed to decode HandoverPreparationinformation in S1AP SourceENBToTargetENBContainer "
++                            "(only release 8 supported)\n");
+     trigger(srslte::failure_ev{});
+     return;
+   }
+@@ -1171,6 +1213,7 @@ void rrc::ue::rrc_mobility::handle_ho_req(idle_st& s, const ho_req_rx_ev& ho_req
+     trigger(srslte::failure_ev{});
+     return;
+   }
++  ho_exec();
+ }
+ 
+ bool rrc::ue::rrc_mobility::apply_ho_prep_cfg(const ho_prep_info_r8_ies_s&    ho_prep,
+@@ -1256,6 +1299,7 @@ void rrc::ue::rrc_mobility::handle_recfg_complete(wait_recfg_comp& s, const recf
+   uint64_t target_eci = (rrc_enb->cfg.enb_id << 8u) + target_cell->cell_common->cell_cfg.cell_id;
+ 
+   rrc_enb->s1ap->send_ho_notify(rrc_ue->rnti, target_eci);
++  ho_finish(true);
+ }
+ 
+ void rrc::ue::rrc_mobility::handle_status_transfer(s1_target_ho_st& s, const status_transfer_ev& erabs)
+@@ -1313,6 +1357,11 @@ void rrc::ue::rrc_mobility::intraenb_ho_st::enter(rrc_mobility* f, const ho_meas
+   uint32_t cell_id = rrc_details::eci_to_cellid(meas_report.target_eci);
+   target_cell      = f->rrc_enb->cell_common_list->get_cell_id(cell_id);
+   source_cell      = f->rrc_ue->cell_ded_list.get_ue_cc_idx(UE_PCELL_CC_IDX)->cell_common;
++  f->ho_start(ho_ctxt_t::intra,
++              source_cell->cell_cfg.pci,
++              meas_report.target_pci,
++              meas_report.target_eci,
++              meas_report.target_rsrp);
+   if (target_cell == nullptr) {
+     f->log_h->error("The target cell_id=0x%x was not found in the list of eNB cells\n", cell_id);
+     f->trigger(srslte::failure_ev{});
+@@ -1345,6 +1394,7 @@ void rrc::ue::rrc_mobility::intraenb_ho_st::enter(rrc_mobility* f, const ho_meas
+     f->trigger(srslte::failure_ev{});
+     return;
+   }
++  f->ho_exec();
+ }
+ 
+ void rrc::ue::rrc_mobility::handle_crnti_ce(intraenb_ho_st& s, const user_crnti_upd_ev& ev)
+@@ -1377,6 +1427,191 @@ void rrc::ue::rrc_mobility::handle_recfg_complete(intraenb_ho_st& s, const recfg
+ {
+   rrc_log->info(
+       "User rnti=0x%x successfully handovered to cell_id=0x%x\n", rrc_ue->rnti, s.target_cell->cell_cfg.cell_id);
++  ho_finish(true);
++}
++
++/*************************************************************************************************
++ *                                  Mobility metrics
++ ************************************************************************************************/
++
++void rrc::ue::rrc_mobility::record_meas_report(const asn1::rrc::meas_results_s& meas_res)
++{
++  rrc_enb->mob_stats.counters.meas_reports++;
++  last_meas.valid                = true;
++  last_meas.time_ms              = rrc_wallclock_ms();
++  last_meas.n_reports++;
++  last_meas.meas_id              = meas_res.meas_id;
++  last_meas.serving.pci          = pcell_pci();
++  last_meas.serving.rsrp_present = true;
++  last_meas.serving.rsrp         = meas_res.meas_result_pcell.rsrp_result;
++  last_meas.serving.rsrq_present = true;
++  last_meas.serving.rsrq         = meas_res.meas_result_pcell.rsrq_result;
++  last_meas.n_neigh              = 0;
++  if (meas_res.meas_result_neigh_cells_present and
++      meas_res.meas_result_neigh_cells.type().value ==
++          meas_results_s::meas_result_neigh_cells_c_::types::meas_result_list_eutra) {
++    for (const meas_result_eutra_s& e : meas_res.meas_result_neigh_cells.meas_result_list_eutra()) {
++      if (last_meas.n_neigh == RRC_MEAS_MAX_NEIGH_CELLS) {
++        break;
++      }
++      rrc_meas_cell_t& c = last_meas.neigh[last_meas.n_neigh++];
++      c.pci              = e.pci;
++      c.rsrp_present     = e.meas_result.rsrp_result_present;
++      c.rsrp             = e.meas_result.rsrp_result;
++      c.rsrq_present     = e.meas_result.rsrq_result_present;
++      c.rsrq             = e.meas_result.rsrq_result;
++    }
++  }
++}
++
++void rrc::ue::rrc_mobility::ho_start(ho_ctxt_t::kind_t kind,
++                                     uint16_t          source_pci,
++                                     uint16_t          target_pci,
++                                     uint32_t          target_eci,
++                                     uint8_t           target_rsrp)
++{
++  // A new attempt while one is open (should not happen): close the old one.
++  ho_finish(false);
++  ho_ctxt            = {};
++  ho_ctxt.kind       = kind;
++  ho_ctxt.start_ms   = rrc_wallclock_ms();
++  ho_ctxt.source_pci = source_pci;
++  ho_ctxt.target_pci = target_pci;
++  ho_ctxt.target_eci = target_eci;
++
++  rrc_ho_counters_t&  cnt  = rrc_enb->mob_stats.counters;
++  rrc_ho_event_type_t type = rrc_ho_event_type_t::intra_start;
++  switch (kind) {
++    case ho_ctxt_t::s1_out:
++      cnt.s1_out_attempt++;
++      type = rrc_ho_event_type_t::s1_out_prep_start;
++      break;
++    case ho_ctxt_t::s1_in:
++      cnt.s1_in_attempt++;
++      type = rrc_ho_event_type_t::s1_in_request;
++      break;
++    default:
++      cnt.intra_attempt++;
++      break;
++  }
++  rrc_ho_event_t& ev = rrc_enb->mob_stats.add_event(type, rrc_ue->rnti);
++  ev.source_pci      = source_pci;
++  ev.target_pci      = target_pci;
++  ev.target_eci      = target_eci;
++  ev.target_rsrp     = target_rsrp;
++  if (last_meas.valid) {
++    ev.serving_rsrp = last_meas.serving.rsrp;
++  }
++}
++
++void rrc::ue::rrc_mobility::ho_exec()
++{
++  if (ho_ctxt.kind == ho_ctxt_t::none or ho_ctxt.exec) {
++    return;
++  }
++  ho_ctxt.exec = true;
++
++  rrc_ho_counters_t& cnt = rrc_enb->mob_stats.counters;
++  rrc_ho_event_type_t type;
++  switch (ho_ctxt.kind) {
++    case ho_ctxt_t::s1_out:
++      cnt.s1_out_prep_success++;
++      type = rrc_ho_event_type_t::s1_out_prep_success;
++      break;
++    case ho_ctxt_t::s1_in:
++      cnt.s1_in_prep_success++;
++      type = rrc_ho_event_type_t::s1_in_prep_success;
++      break;
++    default:
++      // intra-eNB handover has no preparation phase to report
++      return;
++  }
++  rrc_ho_event_t& ev = rrc_enb->mob_stats.add_event(type, rrc_ue->rnti);
++  ev.source_pci      = ho_ctxt.source_pci;
++  ev.target_pci      = ho_ctxt.target_pci;
++  ev.target_eci      = ho_ctxt.target_eci;
++  ev.duration_ms     = (uint32_t)(ev.time_ms - ho_ctxt.start_ms);
++}
++
++void rrc::ue::rrc_mobility::ho_finish(bool success)
++{
++  if (ho_ctxt.kind == ho_ctxt_t::none) {
++    return;
++  }
++  rrc_ho_counters_t&  cnt = rrc_enb->mob_stats.counters;
++  rrc_ho_event_type_t type;
++  switch (ho_ctxt.kind) {
++    case ho_ctxt_t::s1_out:
++      if (not ho_ctxt.exec) {
++        cnt.s1_out_prep_failure++;
++        type = rrc_ho_event_type_t::s1_out_prep_failure;
++      } else if (success) {
++        cnt.s1_out_success++;
++        type = rrc_ho_event_type_t::s1_out_success;
++      } else {
++        cnt.s1_out_failure++;
++        type = rrc_ho_event_type_t::s1_out_failure;
++      }
++      break;
++    case ho_ctxt_t::s1_in:
++      if (not ho_ctxt.exec) {
++        cnt.s1_in_prep_failure++;
++        type = rrc_ho_event_type_t::s1_in_prep_failure;
++      } else if (success) {
++        cnt.s1_in_success++;
++        type = rrc_ho_event_type_t::s1_in_success;
++      } else {
++        cnt.s1_in_failure++;
++        type = rrc_ho_event_type_t::s1_in_failure;
++      }
++      break;
++    default:
++      if (success) {
++        cnt.intra_success++;
++        type = rrc_ho_event_type_t::intra_success;
++      } else {
++        cnt.intra_failure++;
++        type = rrc_ho_event_type_t::intra_failure;
++      }
++      break;
++  }
++  rrc_ho_event_t& ev = rrc_enb->mob_stats.add_event(type, rrc_ue->rnti);
++  ev.source_pci      = ho_ctxt.source_pci;
++  ev.target_pci      = ho_ctxt.target_pci;
++  ev.target_eci      = ho_ctxt.target_eci;
++  ev.duration_ms     = (uint32_t)(ev.time_ms - ho_ctxt.start_ms);
++  ho_ctxt            = {};
++}
++
++void rrc::ue::rrc_mobility::handle_ue_release(bool successful_ho)
++{
++  // Only the source of an S1 handover is released with cause successful-handover.
++  ho_finish(successful_ho and ho_ctxt.kind == ho_ctxt_t::s1_out);
++}
++
++uint16_t rrc::ue::rrc_mobility::pcell_pci() const
++{
++  const cell_info_common* pcell = rrc_ue->get_ue_cc_cfg(UE_PCELL_CC_IDX);
++  return pcell != nullptr ? pcell->cell_cfg.pci : RRC_INVALID_PCI;
++}
++
++rrc_ue_mob_state_t rrc::ue::rrc_mobility::get_mob_state() const
++{
++  if (is_in_state<intraenb_ho_st>()) {
++    return rrc_ue_mob_state_t::intra_enb;
++  }
++  if (is_in_state<s1_target_ho_st>()) {
++    return rrc_ue_mob_state_t::s1_target_prep;
++  }
++  if (is_in_state<wait_recfg_comp>()) {
++    return rrc_ue_mob_state_t::s1_target_exec;
++  }
++  const s1_source_ho_st* src = get_if_current_state<s1_source_ho_st>();
++  if (src != nullptr) {
++    return src->is_in_state<s1_source_ho_st::status_transfer_st>() ? rrc_ue_mob_state_t::s1_source_exec
++                                                                   : rrc_ue_mob_state_t::s1_source_prep;
++  }
++  return rrc_ue_mob_state_t::idle;
+ }
+ 
+ } // namespace srsenb
+diff --git a/srsenb/src/stack/rrc/rrc_ue.cc b/srsenb/src/stack/rrc/rrc_ue.cc
+index 1dbdcebc4..3970bd4a2 100644
+--- a/srsenb/src/stack/rrc/rrc_ue.cc
++++ b/srsenb/src/stack/rrc/rrc_ue.cc
+@@ -477,9 +477,18 @@ void rrc::ue::send_connection_reject()
+  */
+ void rrc::ue::handle_rrc_con_reest_req(rrc_conn_reest_request_s* msg)
+ {
++  {
++    const auto& req = msg->crit_exts.rrc_conn_reest_request_r8();
++    parent->mob_stats.counters.reest_attempt++;
++    rrc_ho_event_t& ev = parent->mob_stats.add_event(rrc_ho_event_type_t::reest_request, rnti);
++    ev.source_pci      = req.ue_id.pci;
++    ev.target_pci      = mobility_handler->pcell_pci();
++    ev.reest_cause     = (int8_t)req.reest_cause.value;
++  }
+   if (not parent->s1ap->is_mme_connected()) {
+     parent->rrc_log->error("MME isn't connected. Sending Connection Reject\n");
+     send_connection_reject();
++    record_reest_reject();
+     return;
+   }
+   parent->rrc_log->debug("rnti=0x%x, phyid=0x%x, smac=0x%x, cause=%s\n",
+@@ -615,6 +624,10 @@ void rrc::ue::handle_rrc_con_reest_complete(rrc_conn_reest_complete_s* msg, srsl
+   // remove old RNTI
+   parent->rem_user_thread(old_reest_rnti);
+ 
++  parent->mob_stats.counters.reest_success++;
++  rrc_ho_event_t& ev = parent->mob_stats.add_event(rrc_ho_event_type_t::reest_success, rnti);
++  ev.target_pci      = mobility_handler->pcell_pci();
++
+   state = RRC_STATE_REESTABLISHMENT_COMPLETE;
+   send_connection_reconf(std::move(pdu));
+ }
+@@ -626,6 +639,14 @@ void rrc::ue::send_connection_reest_rej()
+   dl_ccch_msg_s dl_ccch_msg;
+   dl_ccch_msg.msg.set_c1().set_rrc_conn_reest_reject().crit_exts.set_rrc_conn_reest_reject_r8();
+   send_dl_ccch(&dl_ccch_msg);
++  record_reest_reject();
++}
++
++void rrc::ue::record_reest_reject()
++{
++  parent->mob_stats.counters.reest_reject++;
++  rrc_ho_event_t& ev = parent->mob_stats.add_event(rrc_ho_event_type_t::reest_reject, rnti);
++  ev.target_pci      = mobility_handler->pcell_pci();
+ }
+ 
+ /*
+diff --git a/srsenb/src/stack/upper/s1ap.cc b/srsenb/src/stack/upper/s1ap.cc
+index 616bdf36d..c986ec0f9 100644
+--- a/srsenb/src/stack/upper/s1ap.cc
++++ b/srsenb/src/stack/upper/s1ap.cc
+@@ -771,6 +771,11 @@ bool s1ap::handle_uectxtreleasecommand(const ue_context_release_cmd_s& msg)
+   }
+ 
+   uint16_t rnti = u->ctxt.rnti;
++  const cause_c& cause = msg.protocol_ies.cause.value;
++  if (cause.type().value == cause_c::types_opts::radio_network and
++      cause.radio_network().value == cause_radio_network_opts::successful_ho) {
++    rrc->ho_release_successful(rnti);
++  }
+   rrc->release_erabs(rnti);
+   u->send_uectxtreleasecomplete();
+   users.erase(u);
+-- 
+2.43.0
+

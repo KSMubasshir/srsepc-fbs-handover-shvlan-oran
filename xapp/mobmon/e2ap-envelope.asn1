@@ -1,0 +1,70 @@
+-- Just enough of the E2AP PDU structure to unwrap a RICindication.
+--
+-- Open type fields (InitiatingMessage.value, ProtocolIE-Field.value) are
+-- encoded in APER as a length determinant followed by the octets, which is
+-- also how an unconstrained OCTET STRING is encoded, so they are declared as
+-- OCTET STRING here and decoded a second time with the type the IE id
+-- implies.  Procedure codes and IE ids are from O-RAN.WG3.E2AP.
+
+E2AP-Envelope DEFINITIONS AUTOMATIC TAGS ::=
+
+BEGIN
+
+Criticality ::= ENUMERATED { reject, ignore, notify }
+
+InitiatingMessage ::= SEQUENCE {
+    procedureCode INTEGER (0..255),
+    criticality   Criticality,
+    value         OCTET STRING
+}
+
+SuccessfulOutcome ::= SEQUENCE {
+    procedureCode INTEGER (0..255),
+    criticality   Criticality,
+    value         OCTET STRING
+}
+
+UnsuccessfulOutcome ::= SEQUENCE {
+    procedureCode INTEGER (0..255),
+    criticality   Criticality,
+    value         OCTET STRING
+}
+
+E2AP-PDU ::= CHOICE {
+    initiatingMessage   InitiatingMessage,
+    successfulOutcome   SuccessfulOutcome,
+    unsuccessfulOutcome UnsuccessfulOutcome,
+    ...
+}
+
+ProtocolIE-Field ::= SEQUENCE {
+    id          INTEGER (0..65535),
+    criticality Criticality,
+    value       OCTET STRING
+}
+
+ProtocolIE-Container ::= SEQUENCE (SIZE (0..65535)) OF ProtocolIE-Field
+
+-- RICindication and the other E2AP messages share this shape.
+ProtocolIEMessage ::= SEQUENCE {
+    protocolIEs ProtocolIE-Container,
+    ...
+}
+
+RICrequestID ::= SEQUENCE {
+    ricRequestorID INTEGER (0..65535),
+    ricInstanceID  INTEGER (0..65535),
+    ...
+}
+
+RANfunctionID ::= INTEGER (0..4095)
+
+RICactionID ::= INTEGER (0..255)
+
+RICindicationSN ::= INTEGER (0..65535)
+
+RICindicationType ::= ENUMERATED { report, insert, ... }
+
+OctetString ::= OCTET STRING
+
+END
