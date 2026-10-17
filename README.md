@@ -58,7 +58,7 @@ This POWDER profile deploys an LTE testbed with two eNodeBs for S1 handover expe
    /local/repository/bin/ran-run.sh start enb <run-id>   # enb1 (starts the core too), then enb2
    /local/repository/bin/ran-run.sh start ue <run-id>    # ue: srsue + ping to the core gateway
    ```
-6. Drive handover with the attenuators (`/local/repository/bin/atten -l` lists the path ids), register nodes with NexRAN, etc. Each path has several attenuator ids (e.g. `1,33,2,34:nuc2/nuc1`); set all of them, or the cell is not isolated.
+6. Drive handover from the ue node: `/local/repository/bin/ho-sweep.sh 1to2 <run-id>` (then `2to1`, ...). It steps all attenuator ids of both paths (`atten -l` lists them, e.g. `1,33,2,34:nuc2/nuc1`; setting only one does not isolate the cell) and logs the steps to `atten.log`. Before the UE attaches, `E1=20 E2=60 ho-sweep.sh set <run-id>` puts it on enb1.
 7. Stop: `ran-run.sh stop <role> <run-id>` on each node, `ric-trace.sh stop` on the RIC. Bundles land in `/local/logs/e2run/`.
 
 ### What gets captured
@@ -74,7 +74,9 @@ Wireshark: *Decode As → SCTP port 32222 → E2AP* for the E2 captures.
 
 ## Handover KPIs at the RIC (E2SM-MOB)
 
-The stock srslte-ric service models report no handover information (KPM has per-UE radio and traffic metrics only). [setup-srslte.sh](bin/setup-srslte.sh) pins srslte-ric and applies [patches/srslte-ric/0001-e2sm-mob-handover-kpis.patch](patches/srslte-ric/0001-e2sm-mob-handover-kpis.patch), which adds a service model **ORAN-E2SM-MOB** (OID `1.3.6.1.4.1.53148.1.1.2.102`, RAN function id 4; ASN.1 in [xapp/mobmon/e2sm-mob-v01.00.asn1](xapp/mobmon/e2sm-mob-v01.00.asn1)). Each periodic indication carries:
+[setup-srslte.sh](bin/setup-srslte.sh) pins srslte-ric and applies [patches/srslte-ric/](patches/srslte-ric/). [0002](patches/srslte-ric/0002-srsue-prach-cell-after-handover.patch) fixes srsUE never sending its preamble on the target cell (it kept the source PCI for PRACH when both cells' PRACH configurations match, so T304 expired); without it, handover between these cells always fails.
+
+The stock srslte-ric service models report no handover information (KPM has per-UE radio and traffic metrics only). [0001](patches/srslte-ric/0001-e2sm-mob-handover-kpis.patch) adds a service model **ORAN-E2SM-MOB** (OID `1.3.6.1.4.1.53148.1.1.2.102`, RAN function id 4; ASN.1 in [xapp/mobmon/e2sm-mob-v01.00.asn1](xapp/mobmon/e2sm-mob-v01.00.asn1)). Each periodic indication carries:
 
 - **Cumulative counters**: S1 handover as source (attempt, preparation success/failure, success, failure), as target (the same), intra-eNB handover, RRC re-establishment (attempt, success, reject), measurement reports. Source-side success is a UE context release with cause *successful-handover*; failure is a re-establishment or any other release after the HO command.
 - **Per UE**: RNTI, RRC state, handover state (idle, source preparation/execution, target preparation/execution, intra-eNB), serving PCI, and the last MeasurementReport (serving and neighbour PCI/RSRP/RSRQ, age).
@@ -94,7 +96,7 @@ The latest report per eNB is also at `GET /mobmon/v1/reports` on the mobmon pod 
 |--------|------|---------|
 | [bin/setup-srslte.sh](bin/setup-srslte.sh) | enbs, ue | Build srslte-ric with E2 bindings |
 | [bin/update-enb-config-files.sh](bin/update-enb-config-files.sh) | enbs | PLMN, frequency, gains, srsEPC subscriber db |
-| [bin/configure-enb.sh](bin/configure-enb.sh) | enbs | S1 addresses, RIC address, cell identity, handover neighbor |
+| [bin/configure-enb.sh](bin/configure-enb.sh) | enbs | S1 addresses, RIC address, cell identity, handover neighbor, A3 trigger |
 | [bin/setup-open5gs.sh](bin/setup-open5gs.sh) | core | Install/configure Open5GS 4G core, provision subscribers |
 | [bin/configure-srsepc.sh](bin/configure-srsepc.sh) | core | Bind srsEPC to the core address, provision subscribers |
 | [bin/setup-core-addr.sh](bin/setup-core-addr.sh) | enb1 | Core address alias when the core is co-located |
@@ -102,13 +104,14 @@ The latest report per eNB is also at `GET /mobmon/v1/reports` on the mobmon pod 
 | [bin/ran-run.sh](bin/ran-run.sh) | all RAN nodes | Start/stop a run and collect traces |
 | [bin/ric-trace.sh](bin/ric-trace.sh) | RIC node | E2 capture + RIC log collection |
 | [bin/deploy-mobmon.sh](bin/deploy-mobmon.sh) | RIC node | Build and deploy the mobmon handover KPI xApp |
+| [bin/ho-sweep.sh](bin/ho-sweep.sh) | ue | Drive a handover (`1to2`, `2to1`) by stepping every attenuator id of both paths |
 | [bin/start-enb.sh](bin/start-enb.sh), [bin/start-ue.sh](bin/start-ue.sh) | enbs, ue | Shortcuts for `ran-run.sh start` + tmux attach |
 | [bin/setup-ip-config.sh](bin/setup-ip-config.sh) | enbs | Routes for `shared_vlan` mode |
 | [bin/setup-oran-local.sh](bin/setup-oran-local.sh) | enb1 | Local RIC (`local` mode) |
 
 ## Known limitations
 
-- **Over-the-air handover completion.** With Open5GS, S1 handover preparation succeeds (HandoverRequired → HandoverRequest → HandoverRequestAcknowledge → HandoverCommand) and the UE receives the handover command, but in testing on nuc5300/B210 nodes the UE's random access on the target cell timed out (T304), as did re-establishment (T301), although direct attach to either cell works. Both cells share one carrier and the B210s are not time-synchronized; this needs radio-level tuning.
+- **Handover is co-channel.** Both cells share one carrier, so the neighbor is interference to the serving cell; the A3 trigger is set early (1 dB offset, 0.5 dB hysteresis, 160 ms, see [configure-enb.sh](bin/configure-enb.sh)) so the UE reports before radio link failure. Sweep the attenuators over the full range (`ho-sweep.sh`, 20–60 dB): measured RSRP changes much less than the attenuation, and the cells are not balanced (enb2 reads stronger at equal settings). Each handover interrupts the UE's traffic for about 0.2 s.
 - `control_net` mode carries E2 over the public control network (the RIC's E2Term NodePort is reachable there); S1 stays on the experiment LAN.
 - The local RIC deployment (`local`) failed to clone the O-RAN SC deployment repository in testing; the eNodeB setup now runs before it so the RAN is still usable if it fails.
 

@@ -12,7 +12,9 @@
 # Use the same run-id on every node (e.g. the one printed by ric-trace.sh on
 # the RIC node) so bundles line up.  Everything for a run lands in
 # /local/logs/e2run/<run-id>/ and is bundled to /local/logs/e2run/<run-id>-<role>.tgz
-# on stop.  E2TERM_SCTP / E2TERM_PORT override the RIC address in enb.conf.
+# on stop.  E2TERM_SCTP / E2TERM_PORT override the RIC address in enb.conf;
+# ENB_ARGS / UE_ARGS are appended to the srsenb / srsue command line (e.g.
+# ENB_ARGS="--log.mac_level=info --log.phy_level=info").
 #
 # Captures: E2AP (enb), S1AP + MAC (enb), S1AP (core), MAC (ue).
 #
@@ -78,11 +80,11 @@ start_enb() {
         ARGS="$ARGS --ric.agent.remote_port=$E2_PORT"
     fi
     capture e2-enb "sctp port $E2_PORT"
-    pane "sudo srsenb $ARGS |& tee $D/enb.out"
+    pane "sudo srsenb $ARGS $ENB_ARGS |& tee $D/enb.out"
 }
 
 start_ue() {
-    pane "sudo srsue --log.filename=$D/ue.log --pcap.enable=true --pcap.filename=$D/ue_mac.pcap |& tee $D/ue.out"
+    pane "sudo srsue --log.filename=$D/ue.log --pcap.enable=true --pcap.filename=$D/ue_mac.pcap $UE_ARGS |& tee $D/ue.out"
     # Ping the gateway once the UE has attached; the UE node has no core-type
     # marker, so derive the gateway from the UE's own address.
     pane "until ip -4 -br addr show tun_srsue 2>/dev/null | grep -q /; do sleep 1; done; GW=\`ip -4 -br addr show tun_srsue | awk '{print \$3}' | cut -d/ -f1 | sed 's/\.[0-9]*\$/.1/'\`; ping -i 0.2 \$GW |& tee $D/ping.out"

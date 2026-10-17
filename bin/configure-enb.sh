@@ -15,6 +15,13 @@
 #   e2term_host  optional RIC E2Term address/hostname
 #   e2term_port  optional RIC E2Term SCTP port
 #
+# A3 handover trigger (environment): A3_OFFSET dB (1), A3_HYSTERESIS dB
+# (0.5), A3_TTT ms (160, a TS 36.331 timeToTrigger value).  rr.conf holds
+# offset and hysteresis in the 36.331 0.5 dB units.  Both cells share one
+# carrier, so the neighbor is interference: with srsenb's defaults (3 dB,
+# 480 ms) the serving SINR can drop low enough for radio link failure before
+# the UE's report gets through.
+#
 
 set -x
 
@@ -26,6 +33,9 @@ NBR_ECI=$5
 NBR_PCI=$6
 E2_HOST=$7
 E2_PORT=$8
+A3_OFFSET=${A3_OFFSET:-1}
+A3_HYSTERESIS=${A3_HYSTERESIS:-0.5}
+A3_TTT=${A3_TTT:-160}
 
 if [ -z "$NBR_PCI" ]; then
     echo "usage: $0 <enb_ip> <core_ip> <cell_id> <pci> <nbr_eci> <nbr_pci> [e2term_host] [e2term_port]"
@@ -70,10 +80,10 @@ fi
 
 # Rewrite the serving cell identity and the neighbor list in rr.conf.  The
 # neighbor uses the serving cell's EARFCN: both cells share one frequency.
-sudo python3 - "$RR_CONF" "$CELL_ID" "$PCI" "$NBR_ECI" "$NBR_PCI" <<'PY'
+sudo python3 - "$RR_CONF" "$CELL_ID" "$PCI" "$NBR_ECI" "$NBR_PCI" "$A3_OFFSET" "$A3_HYSTERESIS" "$A3_TTT" <<'PY'
 import re, sys
 
-path, cell_id, pci, nbr_eci, nbr_pci = sys.argv[1:]
+path, cell_id, pci, nbr_eci, nbr_pci, a3_offset, a3_hyst, a3_ttt = sys.argv[1:]
 text = open(path).read()
 
 start = re.search(r'^\s*cell_list\s*=', text, re.M).start()
@@ -96,7 +106,12 @@ neighbors = ('meas_cell_list =\n'
 
 text = (text[:start] + serving + neighbors
         + text[start + meas.end():])
+half_db = lambda db: str(int(round(float(db) * 2)))
+for key, value in (('a3_offset', half_db(a3_offset)), ('a3_hysteresis', half_db(a3_hyst)),
+                   ('a3_time_to_trigger', a3_ttt)):
+    text = re.sub(r'(\b%s\s*=\s*)-?\d+;' % key, r'\g<1>%s;' % value, text)
 open(path, 'w').write(text)
 PY
 
 grep -E '^(enb_id|mme_addr|gtp_bind_addr|s1c_bind_addr|agent\.)' $ENB_CONF
+grep -E 'a3_(offset|hysteresis|time_to_trigger)' $RR_CONF
