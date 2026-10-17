@@ -28,27 +28,18 @@ fi
 [ -z "$RX_GAIN" ] && RX_GAIN=${DEF_RX_GAIN}
 [ -z "$DL_FREQ" ] && DL_FREQ=3435e6
 [ -z "$UL_FREQ" ] && UL_FREQ=3410e6
-[ -z "$DL_EARFCN" ] && DL_EARFCN=
+# Must match the cells' dl_earfcn in rr.conf: dl_freq overrides the radio
+# frequency, but the UE still compares EARFCNs to decide which cells to measure.
+[ -z "$DL_EARFCN" ] && DL_EARFCN=3350
 [ -z "$FREQ_OFFSET" ] && FREQ_OFFSET=0
 [ -z "$DEFKEY" ] && DEFKEY=00112233445566778899aabbccddeeff
+[ -z "$DEFOPC" ] && DEFOPC=63bfa50ee6523365ff14c1f45f88737d
 
 sudo apt-get -y update \
     && sudo apt-get -y install crudini
 
-if [ -n "$DL_EARFCN" ]; then
-    sudo crudini --set /etc/srslte/enb.conf \
-        rf dl_earfcn "$DL_EARFCN"
-else
-    sudo crudini --del /etc/srslte/enb.conf \
-        rf dl_earfcn
-fi
-if [ -n "$UL_EARFCN" ]; then
-    sudo crudini --set /etc/srslte/enb.conf \
-        rf ul_earfcn "$UL_EARFCN"
-else
-    sudo crudini --del /etc/srslte/enb.conf \
-        rf ul_earfcn
-fi
+sudo crudini --set /etc/srslte/ue.conf \
+    rf dl_earfcn "$DL_EARFCN"
 sudo crudini --set /etc/srslte/ue.conf \
     rf dl_freq "$DL_FREQ"
 sudo crudini --set /etc/srslte/ue.conf \
@@ -65,7 +56,9 @@ key=`echo "$1" | cut -d, -f3`
 [ -z "$key" ] && key="$DEFKEY"
 
 sudo crudini --set /etc/srslte/ue.conf \
-    usim algo xor
+    usim algo milenage
+sudo crudini --set /etc/srslte/ue.conf \
+    usim opc "$DEFOPC"
 sudo crudini --set /etc/srslte/ue.conf \
     usim k "$key"
 sudo crudini --set /etc/srslte/ue.conf \

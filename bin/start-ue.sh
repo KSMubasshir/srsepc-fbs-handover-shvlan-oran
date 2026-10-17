@@ -1,25 +1,10 @@
 #!/bin/sh
+#
+# Start srsue and ping the core gateway (IPERF=1 adds an iperf3 client) in
+# tmux session "ran".  Stop with: /local/repository/bin/ran-run.sh stop ue
+#
+# usage: start-ue.sh [run-id]
+#
 
-set -x
-
-if [ -z "$TMUX" ]; then
-    TMUX=1
-fi
-if [ -z "$SESSION" ]; then
-    SESSION="ue"
-fi
-
-session_get() {
-    ( tmux list-sessions | grep -q "^${SESSION}:" ) \
-	|| tmux new-session -d -s "$SESSION"
-}
-
-session_get $SESSION
-
-tmux send-keys -t =$SESSION:0.0 'sudo srsue |& tee /local/logs/srsue.log' C-m
-tmux split-window -v
-tmux send-keys -t =$SESSION:0.1 'ping 192.168.0.1' C-m
-#tmux select-layout even-vertical
-tmux split-window -v
-tmux send-keys -t =$SESSION:0.2 'while true ; do sleep 2 ; iperf3 -c 192.168.0.1 -t 65536 -i 1 ; done |& tee -a /local/logs/iperf.log' C-m
-exec tmux attach-session -d -t $SESSION
+/local/repository/bin/ran-run.sh start ue "$@" || exit 1
+exec tmux attach-session -t ran

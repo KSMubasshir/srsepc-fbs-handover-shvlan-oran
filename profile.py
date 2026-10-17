@@ -23,210 +23,96 @@ class GLOBALS(object):
     NUC_HWTYPE = "nuc5300"
     SRSLTE_IMG = "urn:publicid:IDN+emulab.net+image+PowderProfiles:U18LL-SRSLTE"
 
+    # S1 LAN joining the eNodeBs and the core.  The core always has its own
+    # address; when it is co-located on enb1 it is added there as a
+    # secondary address, so the SGW-U and srsenb never share a GTP-U socket.
+    S1_NETMASK = "255.255.255.0"
+    CORE_IP = "10.20.20.10"
+    ENB_S1_IP = {1: "10.20.20.2", 2: "10.20.20.3"}
+
+    # Single test subscriber (Milenage), shared by all cores.
+    UE_IMSI = "001010012345001"
+    UE_IMEI = "353490012345001"
+    UE_KEY = "00112233445566778899aabbccddeeff"
+    UE_OPC = "63bfa50ee6523365ff14c1f45f88737d"
+    UE_STATIC_IP = "192.168.0.10"  # srsEPC only
+
+    # Default E2Term SCTP port per O-RAN mode: the O-RAN profile exposes
+    # e2term as NodePort 32222 on the RIC node; the service port is 36422.
+    E2TERM_PORT = {"control_net": "32222", "shared_vlan": "36422", "local": "36422"}
+
 # ======== EXPERIMENT DESCRIPTION ========
 tourDescription = """
 ### srsRAN S1 Handover w/ O-RAN Integration
 
-This profile creates a complete LTE testbed with S1 handover capabilities and optional O-RAN RIC integration. 
-It deploys srsRAN software on three Intel NUC nodes with B210 SDRs in a controlled RF environment.
+This profile creates an LTE testbed with two eNodeBs for S1 handover experiments, connected to an O-RAN SC Near-RT RIC over E2.
+It deploys srsRAN (the POWDER E2-enabled `srslte-ric` fork) on three Intel NUC nodes with B210 SDRs in a controlled RF environment.
 
 #### **Architecture**
-- **`ue` node**: srsUE (User Equipment) with B210 SDR
-- **`enb1` node**: srsEPC + srsENB (Primary eNodeB + Core Network) 
-- **`fake_enb` node**: srsENB (Secondary eNodeB for handover testing)
-- **O-RAN Integration Options**:
-  - **Local RIC**: Deploy O-RAN SC RIC directly on eNB1 node (simplified setup)
-  - **Remote RIC**: Connect to separate O-RAN RIC experiment via shared VLAN
+- **`ue` node**: srsUE with B210 SDR, RF-linked to both eNodeBs
+- **`enb1` node**: srsENB (cell PCI 1), plus the core network unless a separate `epc` node is requested
+- **`enb2` node**: srsENB (cell PCI 2), handover neighbor of `enb1`
+- **`epc` node** (optional): core network
+- **S1 LAN** (`10.20.20.0/24`): joins the eNodeBs and the core (core address `10.20.20.10`)
 
-#### **Key Capabilities**
-- **Complete LTE Stack**: Full EPC + eNB + UE deployment
-- **S1 Handover Testing**: Seamless handover between eNodeBs
-- **O-RAN RIC Integration**: E2 agent connectivity with configurable parameters
+#### **Core network**
+- **Open5GS** (default): its MME implements S1 handover
+- **srsEPC**: lightweight, but its MME does **not** implement S1 handover
 
-#### **Parameterization Options**
-All key parameters are configurable during experiment instantiation:
-
-**Hardware Configuration:**
-- Select specific NUC nodes for each component
-
-**Network Configuration:**  
-- Shared VLAN options (only for remote O-RAN integration)
-- Custom IP addressing and subnet masks
-- Network multiplexing options
-
-**O-RAN Integration:**
-- **Local RIC Deployment**: Deploy O-RAN SC RIC directly on eNB1 (no VLAN setup needed)
-- **Remote RIC Connection**: Connect to separate O-RAN experiment via shared VLAN
-- Gateway address (default: `10.254.254.1`)
-- Kubernetes subnets (default: `10.96.0.0/12`)
-- Fully customizable for your O-RAN experiment setup
-
-**Advanced Options:**
-- VNC remote desktop access
-- Network multiplexing control
+#### **O-RAN RIC connectivity**
+- **Remote RIC over the control network** (default): eNodeBs reach the E2Term NodePort (32222) of a separate `PowderProfiles/O-RAN` experiment directly. No shared VLAN needed.
+- **Remote RIC over a shared VLAN**: eNodeBs join a shared VLAN with the O-RAN experiment and route Kubernetes service subnets via its gateway.
+- **Local RIC on enb1** (experimental): O-RAN SC RIC in `kind` on `enb1`.
 """
 
 tourInstructions = """
 ### Instructions
 
-This profile provides a complete srsRAN S1 handover testbed with O-RAN integration capabilities.
+#### **1. Start the RIC**
 
-#### **O-RAN Integration Options**
+Start a `PowderProfiles/O-RAN` experiment (`https://www.powderwireless.net/p/PowderProfiles/O-RAN`) and wait for its setup to finish.
+For the default control-network mode, set the `E2Term host` parameter of this profile to that experiment's node, e.g. `pc797.emulab.net`.
+(If you did not know it at instantiation, pass it at run time: `E2TERM_SCTP=<ip> E2TERM_PORT=32222 /local/repository/bin/start-enb.sh`.)
 
-Choose one of two O-RAN deployment methods:
-
-**Option 1: Local RIC Deployment (Recommended)**
-- Enable `Deploy O-RAN RIC on eNodeB` parameter during instantiation
-- O-RAN SC RIC will be automatically deployed on the eNB1 node
-- **No shared VLAN configuration needed** - VLAN options are automatically disabled
-- E2Term service runs locally accessible via cluster IP
-
-**Option 2: Remote RIC Connection**
-- Disable `Deploy O-RAN RIC on eNodeB` parameter
-- Configure shared VLAN parameters for remote O-RAN connectivity
-- First start an O-RAN experiment using the companion profile: `https://www.powderwireless.net/p/PowderProfiles/O-RAN`
-- Ensure it uses the **same shared VLAN name** configured in this experiment
-- Note the **E2Term service IP** from the O-RAN experiment:
-  ```bash
-  kubectl get svc -n ricplt --field-selector metadata.name=service-ricplt-e2term-sctp-alpha -o jsonpath='{.items[0].spec.clusterIP}'
-  ```
-
-#### **Deployment Steps**
-
-**1. Setup and Verification**
-All nodes automatically run setup scripts during boot:
-- `setup-srslte.sh` - Installs and configures srsRAN software (~5 min)
-- `tune-cpu.sh` & `tune-b210.sh` - Optimizes system performance (~2 min)
-- `update-*-config-files.sh` - Generates node-specific configurations (~1 min)
-- `setup-oran-local.sh` - Deploys O-RAN RIC (if enabled, ~20-25 min)
-
-**For Local O-RAN Setup Progress:**
+On the RIC node, onboard and deploy the NexRAN xApp:
 ```bash
-# Check setup progress on enb1 (available immediately)
-/local/repository/bin/check-oran-setup.sh
-
-# Monitor setup logs in real-time (if needed)
-tail -f /var/log/setup-oran-local.log
+/local/setup/oran/dms_cli onboard /local/profile-public/nexran-config-file.json /local/setup/oran/xapp-embedded-schema.json
+/local/setup/oran/dms_cli install nexran 0.1.0 ricxapp
 ```
 
-**2. Start Core Network on `enb1`**
+#### **2. Wait for node setup**
+
+`enb1` and `enb2` build srsRAN with E2 support (~15 min); the core is installed on `enb1` (or `epc`).
+Setup output: `/var/tmp/startup-*.txt`; completion markers: `/local/setup/*-done`.
+
+#### **3. Run an experiment with traces**
+
+Copy `bin/ric-trace.sh` to the RIC node and start RIC-side collection; it prints a run id:
 ```bash
-# SSH to enb1 node
-ssh enb1
-
-# Start the Evolved Packet Core (EPC)
-sudo srsepc
+/local/logs/e2run/ric-trace.sh start
 ```
-
-**3. Start Primary eNodeB on `enb1`** 
-In a new SSH session to `enb1`:
-
-**For Local O-RAN RIC (if enabled in parameters):**
+Then, with that run id, start (in order) `enb1`, `enb2`, and the `ue`:
 ```bash
-# Wait for O-RAN setup to complete (~20-25 minutes after node boot)
-# Check setup progress: /local/repository/bin/check-oran-setup.sh
-
-# Once setup is complete, get E2Term service IP from local RIC
-E2TERM_IP=$(/local/repository/bin/get-e2term-ip.sh | grep "E2Term SCTP IP:" | cut -d' ' -f4)
-
-# Start eNodeB with local RIC integration
-sudo srsenb --ric.agent.remote_ipv4_addr=${E2TERM_IP} --log.all_level=warn --ric.agent.log_level=debug --log.filename=stdout
-
-# Monitor RIC status: /local/repository/bin/manage-oran-ric.sh status
+/local/repository/bin/ran-run.sh start enb <run-id>     # on enb1 (starts the core too) and enb2
+/local/repository/bin/ran-run.sh start ue <run-id>      # on ue; pings the core gateway (IPERF=1 adds iperf3)
 ```
+Everything runs in tmux session `ran` (`tmux attach -t ran`). Stop each node with `ran-run.sh stop <role> <run-id>` and the RIC with `ric-trace.sh stop`;
+each writes a bundle under `/local/logs/e2run/`.
 
-**For Remote O-RAN RIC (via shared VLAN):**
+Captures: E2AP (RIC node and each eNodeB), S1AP and MAC (eNodeBs), S1AP and Open5GS logs (core), MAC (UE), plus RIC component and xApp logs.
+Decode E2 in Wireshark with *Decode As: SCTP port 32222 -> E2AP*.
+
+#### **4. Drive handover**
+
+The RF paths are attenuator-controlled. On any node, `/local/repository/bin/atten -l` lists the attenuator ids per path; raise the serving cell's path in steps:
 ```bash
-# Use E2Term IP from remote O-RAN experiment
-sudo srsenb --ric.agent.remote_ipv4_addr=${E2TERM_IP} --log.all_level=warn --ric.agent.log_level=debug --log.filename=stdout
+for v in 25 30 35 40 45 50; do for id in <ids of serving path>; do /local/repository/bin/atten $id $v; done; sleep 4; done
 ```
+Both cells are configured as each other's A3 neighbors (same EARFCN, PCI 1 and 2).
 
-**For standalone operation (no O-RAN):**
-```bash
-sudo srsenb
-```
+#### **5. Use NexRAN**
 
-**4. Start Fake eNodeB for Handover Testing**
-```bash
-# SSH to fake_enb node  
-ssh fake_enb
-
-# Start the fake eNodeB (acts as handover target)
-sudo srsenb --enb.enb_id=0x20 --enb.cell_id=0x02 --enb.tac=0x0002
-```
-
-**5. Start UE and Test Connectivity**
-```bash
-# SSH to ue node
-ssh ue  
-
-# Start the User Equipment
-sudo srsue
-
-# In another terminal, test connectivity:
-ping 172.16.0.1  # Ping the EPC gateway
-```
-
-**6. Observe Handover Events**
-- Monitor logs on both `enb1` and `fake_enb` for S1 handover events
-- Watch O-RAN RIC interactions (local or remote, if configured)
-- UE should seamlessly hand over between the two eNodeBs
-
-#### **Local O-RAN RIC Management**
-
-If you enabled local O-RAN RIC deployment, use these management commands on `enb1`:
-
-```bash
-# Check RIC status
-/local/repository/bin/manage-oran-ric.sh status
-
-# Get E2Term IP for eNodeB configuration
-/local/repository/bin/manage-oran-ric.sh e2term-ip
-
-# Monitor E2 termination logs
-/local/repository/bin/manage-oran-ric.sh logs e2term-alpha
-
-# Restart RIC services if needed
-/local/repository/bin/manage-oran-ric.sh restart
-
-# Direct kubectl access to RIC
-kubectl get pods -n ricplt
-kubectl logs -f -n ricplt -l app=ricplt-e2mgr
-```
-
-#### **Troubleshooting Local O-RAN**
-
-**RIC not starting:**
-1. Check Docker status: `systemctl status docker`
-2. Verify kind cluster: `kind get clusters`
-3. Check pod status: `kubectl get pods -n ricplt -n ricinfra`
-
-**E2 connection failures:**
-1. Verify E2Term service: `kubectl get svc -n ricplt service-ricplt-e2term-sctp-alpha`
-2. Check E2Term logs: `kubectl logs -n ricplt -l app=ricplt-e2term-alpha`
-3. Test connectivity: `telnet <E2TERM_IP> 36421`
-
-#### **Advanced Configuration**
-
-**Custom UE/eNB Configuration:**
-- Configuration files are auto-generated in `/local/etc/srsran/`
-- Modify parameters and restart services as needed
-
-**O-RAN RIC Integration:**
-- Deploy `kpimon` xApp in O-RAN experiment after eNB connection
-- Monitor KPI reports and RIC control messages
-- Experiment with RIC-driven handover policies
-
-**Troubleshooting:**
-- Check `/var/log/` for service logs
-- Verify RF connectivity with `sudo /local/repository/bin/atten`
-- Use VNC (if enabled) for graphical debugging tools
-
-#### **Expected Results**
-- UE successfully attaches to `enb1`
-- Data connectivity through EPC core network  
-- Successful S1 handover to `fake_enb`
-- O-RAN RIC visibility into handover events (if configured)
+On the RIC node (`. /local/repository/demo/get-env.sh` first), register the eNodeBs (`id` 1 and 2, `mcc` 001, `mnc` 01) and the UE (`001010012345001`) with NexRAN; see `/local/repository/demo/run-nexran-slicing-4G.sh` for the API calls.
 """
 
 # ======== PARAMETER DEFINITIONS ========
@@ -234,66 +120,84 @@ pc = portal.Context()
 
 # Define parameter groups for better organization
 pc.defineParameterGroup("hardware", "Hardware Configuration")
-pc.defineParameterGroup("networking", "Network Configuration") 
+pc.defineParameterGroup("core", "Core Network")
 pc.defineParameterGroup("oran", "O-RAN Integration")
+pc.defineParameterGroup("networking", "Network Configuration")
 pc.defineParameterGroup("advanced", "Advanced Options")
 
-# O-RAN Integration
-pc.defineParameter("deploy_oran_locally", "Deploy O-RAN RIC on eNodeB", portal.ParameterType.BOOLEAN, False,
-    longDescription="Deploy O-RAN SC RIC directly on the eNB1 node instead of using separate experiment. Simplifies setup and eliminates network issues.",
-    groupId="oran")
-
-# Hardware Configuration - EPC is optional (if disabled, EPC runs on enb1)
+# Hardware Configuration - EPC is optional (if disabled, the core runs on enb1)
 pc.defineParameter("deploy_epc_node", "Deploy separate EPC node", portal.ParameterType.BOOLEAN, False,
-    longDescription="Deploy a separate EPC node. If disabled, the EPC will run on the enb1 node.",
+    longDescription="Deploy a separate core network node. If disabled, the core will run on the enb1 node.",
     groupId="hardware")
 pc.defineParameter("epc_node", "Node for EPC", portal.ParameterType.STRING, "nuc1", groupId="hardware")
 pc.defineParameter("enb1_node", "Node for eNB1", portal.ParameterType.STRING, "nuc2", groupId="hardware")
 pc.defineParameter("enb2_node", "Node for eNB2", portal.ParameterType.STRING, "nuc4", groupId="hardware")
 pc.defineParameter("ue_node", "Node for UE", portal.ParameterType.STRING, "nuc3", groupId="hardware")
+
+# Core Network
+pc.defineParameter("core_type", "Core network", portal.ParameterType.STRING, "open5gs",
+    [("open5gs", "Open5GS (supports S1 handover)"), ("srsepc", "srsEPC (no S1 handover)")],
+    longDescription="Core network software. srsEPC's MME does not implement S1 handover, so handover attempts time out in the source eNodeB; use Open5GS for handover experiments.",
+    groupId="core")
+
+# O-RAN Integration
+pc.defineParameter("oran_mode", "O-RAN RIC connectivity", portal.ParameterType.STRING, "control_net",
+    [("control_net", "Remote RIC over the control network"),
+     ("shared_vlan", "Remote RIC over a shared VLAN"),
+     ("local", "Local RIC on enb1 (experimental)"),
+     ("none", "No RIC")],
+    longDescription="How the eNodeB E2 agents reach a Near-RT RIC. 'control_net' connects directly to the E2Term NodePort of a separate PowderProfiles/O-RAN experiment over the POWDER control network. 'shared_vlan' connects over a shared VLAN and routes the RIC's Kubernetes subnets via its gateway. 'local' deploys the O-RAN SC RIC in kind on enb1.",
+    groupId="oran")
+pc.defineParameter("oran_e2term_host", "E2Term host", portal.ParameterType.STRING, "",
+    longDescription="Address of the RIC's E2Term. For 'control_net', the control-network hostname or IP of the O-RAN experiment's node (e.g. pc797.emulab.net). For 'shared_vlan', the e2term SCTP service's cluster IP. Leave empty to supply it at run time via E2TERM_SCTP.",
+    groupId="oran")
+pc.defineParameter("oran_e2term_port", "E2Term SCTP port", portal.ParameterType.STRING, "",
+    longDescription="E2Term SCTP port. Empty selects 32222 (the O-RAN profile's NodePort) for 'control_net' and 36422 otherwise.",
+    groupId="oran")
+pc.defineParameter(
+    "oran_address", "O-RAN Services Gateway Address (shared VLAN)",
+    portal.ParameterType.STRING, "10.254.254.1",
+    longDescription="The IP address of the O-RAN services gateway running on an adjacent experiment connected to the same shared VLAN. Only used with 'shared_vlan'.",
+    groupId="oran")
+pc.defineParameter(
+    "oran_virtual_subnets", "O-RAN Kubernetes Subnets to route via Gateway (shared VLAN)",
+    portal.ParameterType.STRING, "10.96.0.0/12",
+    longDescription="A space-separated list of subnets in CIDR format to route via the O-RAN Services Gateway Address. Only used with 'shared_vlan'.",
+    groupId="oran")
+
 # Network Configuration
-pc.defineParameter("link_enbs", "Create link between eNodeBs", portal.ParameterType.BOOLEAN, False,
-    longDescription="Create an optional network link between the two eNodeBs (enb1 and enb2) for X2 interface or other inter-eNodeB communication.",
-    groupId="networking")
-pc.defineParameter("shared_vlan", "Shared VLAN name (for remote O-RAN only)", portal.ParameterType.STRING, "", 
-    longDescription="Name of an existing shared VLAN to connect to remote O-RAN experiment. Only used when 'Deploy O-RAN RIC on eNodeB' is disabled. Leave empty if using local O-RAN or no O-RAN integration.",
+pc.defineParameter("shared_vlan", "Shared VLAN name (shared VLAN mode only)", portal.ParameterType.STRING, "",
+    longDescription="Name of an existing shared VLAN to connect to a remote O-RAN experiment. Required when O-RAN connectivity is 'shared_vlan'; ignored otherwise.",
     groupId="networking")
 pc.defineParameter(
     "shared_vlan_netmask", "Shared VLAN IP Netmask",
     portal.ParameterType.STRING, "255.255.255.0",
-    longDescription="Set the subnet mask for the shared VLAN interface. Only used with remote O-RAN integration.", 
+    longDescription="Set the subnet mask for the shared VLAN interface. Only used with 'shared_vlan'.",
     groupId="networking")
 pc.defineParameter(
     "shared_vlan_gateway", "Shared VLAN Gateway Address",
     portal.ParameterType.STRING, "192.168.1.1",
-    longDescription="The gateway IP address for the shared VLAN subnet. Only used with remote O-RAN integration.", 
+    longDescription="The gateway IP address for the shared VLAN subnet. Only used with 'shared_vlan'.",
     groupId="networking")
 pc.defineParameter(
     "multiplex_lans", "Multiplex Networks",
     portal.ParameterType.BOOLEAN, True,
-    longDescription="Multiplex any networks over physical interfaces using VLANs.", 
+    longDescription="Multiplex any networks over physical interfaces using VLANs.",
     groupId="advanced")
-
-# O-RAN Integration Parameters
-pc.defineParameter(
-    "oran_address", "O-RAN Services Gateway Address",
-    portal.ParameterType.STRING, "10.254.254.1",
-    longDescription="The IP address of the O-RAN services gateway running on an adjacent experiment connected to the same shared VLAN. Change this to match your O-RAN experiment's gateway address.",
-    groupId="oran")
-pc.defineParameter(
-    "oran_virtual_subnets", "O-RAN Kubernetes Subnets to route via Gateway",
-    portal.ParameterType.STRING, "10.96.0.0/12",
-    longDescription="A space-separated list of subnets in CIDR format to route via the O-RAN Services Gateway Address. Common values: '10.96.0.0/12' for default Kubernetes, '10.244.0.0/16' for some CNI configurations.",
-    groupId="oran")
 
 # Advanced Options
 pc.defineParameter(
     "install_vnc", "Install VNC on Compute Nodes",
     portal.ParameterType.BOOLEAN, False,
-    longDescription="Install VNC on the compute nodes for remote desktop access.", 
+    longDescription="Install VNC on the compute nodes for remote desktop access.",
     groupId="advanced")
 
 params = pc.bindParameters()
+
+if params.oran_mode == "shared_vlan" and not params.shared_vlan:
+    pc.reportError(portal.ParameterError(
+        "Shared VLAN mode requires a shared VLAN name.", ["shared_vlan", "oran_mode"]))
+
 pc.verifyParameters()
 
 # ======== MAIN EXPERIMENT SETUP ========
@@ -301,6 +205,12 @@ request = pc.makeRequestRSpec()
 
 if params.install_vnc:
     request.initVNC()
+
+E2TERM_HOST = ""
+E2TERM_PORT = ""
+if params.oran_mode != "none":
+    E2TERM_HOST = params.oran_e2term_host.strip()
+    E2TERM_PORT = params.oran_e2term_port.strip() or GLOBALS.E2TERM_PORT[params.oran_mode]
 
 # ======== HELPER FUNCTIONS ========
 def next_ipv4_addr(base_addr_str, mask_str, offset):
@@ -315,12 +225,33 @@ def next_ipv4_addr(base_addr_str, mask_str, offset):
             mask_str, base_addr_str, offset))
     return socket.inet_ntoa(struct.pack(">i", ni))
 
+def bin_cmd(script, *args):
+    """
+    Builds a command line for a script in the repository's bin directory.
+    """
+    return " ".join([GLOBALS.BIN_PATH + "/" + script] + ["'%s'" % (a,) for a in args])
+
+def add_core_services(node):
+    """
+    Adds core network services (Open5GS or srsEPC) bound to the core address.
+    """
+    if params.core_type == "open5gs":
+        sub = ",".join([GLOBALS.UE_IMSI, GLOBALS.UE_KEY, GLOBALS.UE_OPC])
+        node.addService(rspec.Execute(shell="bash", command=bin_cmd(
+            "setup-open5gs.sh", GLOBALS.CORE_IP, sub)))
+    else:
+        sub = ",".join([GLOBALS.UE_IMSI, GLOBALS.UE_KEY, GLOBALS.UE_OPC, GLOBALS.UE_STATIC_IP])
+        node.addService(rspec.Execute(shell="bash", command=bin_cmd(
+            "configure-srsepc.sh", GLOBALS.CORE_IP, sub)))
+
 def add_epc_services(epc):
     """
-    Adds services for EPC node.
+    Adds services for the separate EPC node.
     """
     epc.addService(rspec.Execute(shell="bash", command="/local/repository/bin/tune-cpu.sh"))
-    epc.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-srslte.sh"))
+    if params.core_type == "srsepc":
+        epc.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-srslte.sh"))
+    add_core_services(epc)
     if params.install_vnc:
         epc.startVNC()
 
@@ -340,53 +271,45 @@ def add_ue_services(ue, ue_index):
 
 def add_enb_services(enb, enb_index):
     """
-    Adds services for eNodeB nodes following srslte-shvlan-oran pattern.
+    Adds services for eNodeB nodes.  Order matters: Execute services run in
+    sequence, so the srsRAN build and configuration come before the
+    (long-running, failure-prone) local RIC deployment.
     """
     enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/tune-cpu.sh"))
     enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/tune-b210.sh"))
-    
-    # Deploy O-RAN RIC locally on eNB1 if enabled (only on the primary eNodeB)
-    if params.deploy_oran_locally and enb_index == 1:
-        # Install Docker and Kubernetes
-        enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-oran-local.sh"))
-    
-    # Add O-RAN IP configuration only for remote O-RAN (not needed for local RIC)
-    if params.shared_vlan and not params.deploy_oran_locally:
-        enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-ip-config.sh %s '%s'" % (params.oran_address, params.oran_virtual_subnets)))
-    
     enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-srslte.sh"))
-    
-    # Configure eNB with UE information (simplified for handover scenario)
-    imsi = "001010{:06d}001".format(12345)  # Use consistent IMSI for handover
-    imei = "353490{:06d}001".format(12345)
-    ue_ip = "192.168.0.10"
-    enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/update-enb-config-files.sh '0x{:03x}' '{},{},{},{}'".format(enb_index, 1, imsi, imei, ue_ip)))
-    
+
+    ue_db = ",".join(["1", GLOBALS.UE_IMSI, GLOBALS.UE_IMEI, GLOBALS.UE_STATIC_IP])
+    enb.addService(rspec.Execute(shell="bash", command=bin_cmd(
+        "update-enb-config-files.sh", "0x{:03x}".format(enb_index), ue_db)))
+
+    # Core co-located on enb1: give it its own S1 LAN address.
+    if enb_index == 1 and not params.deploy_epc_node:
+        enb.addService(rspec.Execute(shell="bash", command=bin_cmd(
+            "setup-core-addr.sh", GLOBALS.CORE_IP)))
+        add_core_services(enb)
+
+    # Remote O-RAN over the shared VLAN: route the RIC's Kubernetes subnets
+    # via its gateway (before configure-enb.sh resolves the E2 source address).
+    if params.oran_mode == "shared_vlan":
+        enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-ip-config.sh %s '%s'" % (params.oran_address, params.oran_virtual_subnets)))
+
+    # Cell identity and handover neighbor: ECI = (enb_id << 8) | cell_id,
+    # with cell_id = enb_index for both eNodeBs.
+    nbr_index = 2 if enb_index == 1 else 1
+    enb.addService(rspec.Execute(shell="bash", command=bin_cmd(
+        "configure-enb.sh",
+        GLOBALS.ENB_S1_IP[enb_index], GLOBALS.CORE_IP,
+        "0x{:02x}".format(enb_index), str(enb_index),
+        "0x{:05x}".format((nbr_index << 8) | nbr_index), str(nbr_index),
+        E2TERM_HOST, E2TERM_PORT)))
+
+    # Deploy O-RAN RIC locally on eNB1 if enabled (only on the primary eNodeB)
+    if params.oran_mode == "local" and enb_index == 1:
+        enb.addService(rspec.Execute(shell="bash", command="/local/repository/bin/setup-oran-local.sh"))
+
     if params.install_vnc:
         enb.startVNC()
-
-def add_services(node, role):
-    """
-    Legacy function for backward compatibility - redirects to specific service functions.
-    """
-    if role == "EPC":
-        add_epc_services(node)
-    elif role == "UE":
-        add_ue_services(node, 1)
-    elif role in ["eNodeB1", "eNodeB2"]:
-        add_enb_services(node, 1 if role == "eNodeB1" else 2)
-
-def create_node(name, component_id, role):
-    """
-    Creates a node with the specified name and hardware type.
-    """
-    node = request.RawPC(name)
-    node.hardware_type = GLOBALS.NUC_HWTYPE
-    node.component_id = component_id
-    node.disk_image = GLOBALS.SRSLTE_IMG
-    node.Desire("rf-controlled", 1)
-    add_services(node, role)
-    return node
 
 def create_interface(node, iface_name, ip_address=None, vlan_name=None):
     """
@@ -394,7 +317,7 @@ def create_interface(node, iface_name, ip_address=None, vlan_name=None):
     """
     iface = node.addInterface(iface_name)
     if ip_address:
-        iface.addAddress(rspec.IPv4Address(ip_address, "255.255.255.0"))
+        iface.addAddress(rspec.IPv4Address(ip_address, GLOBALS.S1_NETMASK))
     if vlan_name:
         iface.vlan_name = vlan_name
     return iface
@@ -414,6 +337,8 @@ def connect_shared_vlan(node, vlan_name, ip_address, netmask):
         link.best_effort = True
 
 # ======== SETUP NODES ========
+s1_ifaces = []
+
 # Setup optional EPC node
 if params.deploy_epc_node:
     epc = request.RawPC("epc")
@@ -421,8 +346,7 @@ if params.deploy_epc_node:
     epc.component_id = params.epc_node
     epc.disk_image = GLOBALS.SRSLTE_IMG
     add_epc_services(epc)
-    epc_enb1_iface = create_interface(epc, "epc_enb1", "10.20.20.1")
-    epc_enb2_iface = create_interface(epc, "epc_enb2", "10.20.21.1")
+    s1_ifaces.append(create_interface(epc, "epc_s1", GLOBALS.CORE_IP))
 
 # Setup UE node
 ue = request.RawPC("ue")
@@ -442,10 +366,7 @@ enb1.disk_image = GLOBALS.SRSLTE_IMG
 enb1.Desire("rf-controlled", 1)
 add_enb_services(enb1, 1)
 enb1_ue_rf = create_interface(enb1, "enb1_ue_rf")
-if params.deploy_epc_node:
-    enb1_epc_iface = create_interface(enb1, "enb1_epc", "10.20.20.2")
-if params.link_enbs:
-    enb1_to_enb2 = create_interface(enb1, "enb1_to_enb2", "10.10.10.1")
+s1_ifaces.append(create_interface(enb1, "enb1_s1", GLOBALS.ENB_S1_IP[1]))
 
 # Setup second eNodeB
 enb2 = request.RawPC("enb2")
@@ -455,10 +376,7 @@ enb2.disk_image = GLOBALS.SRSLTE_IMG
 enb2.Desire("rf-controlled", 1)
 add_enb_services(enb2, 2)
 enb2_ue_rf = create_interface(enb2, "enb2_ue_rf")
-if params.deploy_epc_node:
-    enb2_epc_iface = create_interface(enb2, "enb2_epc", "10.20.21.2")
-if params.link_enbs:
-    enb2_to_enb1 = create_interface(enb2, "enb2_to_enb1", "10.10.10.2")
+s1_ifaces.append(create_interface(enb2, "enb2_s1", GLOBALS.ENB_S1_IP[2]))
 
 # ======== SETUP NETWORK LINKS ========
 # Create RF links between eNodeBs and UE
@@ -470,37 +388,20 @@ rflink2 = request.RFLink("rflink2")
 rflink2.addInterface(enb2_ue_rf)
 rflink2.addInterface(ue_enb2_rf)
 
-# Create links between EPC and eNodeBs (S1 interface)
-if params.deploy_epc_node:
-    epc_enb1_link = request.Link("epc_enb1_link")
-    epc_enb1_link.addInterface(epc_enb1_iface)
-    epc_enb1_link.addInterface(enb1_epc_iface)
-    if params.multiplex_lans:
-        epc_enb1_link.link_multiplexing = True
-        epc_enb1_link.best_effort = True
-    
-    epc_enb2_link = request.Link("epc_enb2_link")
-    epc_enb2_link.addInterface(epc_enb2_iface)
-    epc_enb2_link.addInterface(enb2_epc_iface)
-    if params.multiplex_lans:
-        epc_enb2_link.link_multiplexing = True
-        epc_enb2_link.best_effort = True
+# S1 LAN between the eNodeBs and the core (also usable for X2)
+s1lan = request.LAN("s1lan")
+for iface in s1_ifaces:
+    s1lan.addInterface(iface)
+if params.multiplex_lans:
+    s1lan.link_multiplexing = True
+    s1lan.best_effort = True
 
-# Create optional link between eNodeBs (for X2 interface or inter-eNB communication)
-if params.link_enbs:
-    enb_link = request.Link("enb_link")
-    enb_link.addInterface(enb1_to_enb2)
-    enb_link.addInterface(enb2_to_enb1)
-    if params.multiplex_lans:
-        enb_link.link_multiplexing = True
-        enb_link.best_effort = True
-
-# Create shared VLAN only for remote O-RAN integration (not needed for local RIC)
-if params.shared_vlan and not params.deploy_oran_locally:
+# Create shared VLAN only for remote O-RAN integration over a shared VLAN
+if params.oran_mode == "shared_vlan":
     # Calculate IP addresses for each node using O-RAN address as base
     enb1_ip = next_ipv4_addr(params.oran_address, params.shared_vlan_netmask, 1)
     enb2_ip = next_ipv4_addr(params.oran_address, params.shared_vlan_netmask, 2)
-    
+
     # Connect nodes to shared VLAN
     connect_shared_vlan(enb1, params.shared_vlan, enb1_ip, params.shared_vlan_netmask)
     connect_shared_vlan(enb2, params.shared_vlan, enb2_ip, params.shared_vlan_netmask)

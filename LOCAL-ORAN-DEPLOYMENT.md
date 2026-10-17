@@ -55,7 +55,7 @@ The enhanced `srsepc-fbs-handover-with-oran` profile now supports deploying the 
 ### **1. Enable Local RIC Deployment**
 
 When instantiating the experiment:
-- Set `Deploy O-RAN RIC on eNodeB` parameter to `True`
+- Set the `O-RAN RIC connectivity` parameter to `Local RIC on enb1 (experimental)`
 - Choose adequate hardware type (recommend `d740`)
 - **Shared VLAN options are automatically disabled and ignored** when local RIC is enabled
 

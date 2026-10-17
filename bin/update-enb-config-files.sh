@@ -35,6 +35,7 @@ fi
 [ -z "$UL_FREQ" ] && UL_FREQ=3410e6
 [ -z "$DL_EARFCN" ] && DL_EARFCN=
 [ -z "$DEFKEY" ] && DEFKEY=00112233445566778899aabbccddeeff
+[ -z "$DEFOPC" ] && DEFOPC=63bfa50ee6523365ff14c1f45f88737d
 [ -z "$DL_MASK" ] && DL_MASK=0x0
 [ -z "$UL_MASK" ] && UL_MASK=0x0
 [ -z "$SLICER_ENABLE" ] && SLICER_ENABLE=1
@@ -114,8 +115,8 @@ while [ -n "$1" ]; do
     [ -z "$key" ] && key="$DEFKEY"
     shift
 
-    sudo sed -i -nre "s/^(ue${idx},.*)\$/#\\1/" /etc/srslte/user_db.csv
-    echo "ue${idx},xor,${imsi},${key},opc,63bfa50ee6523365ff14c1f45f88737d,9001,000000001234,7,${ipaddr}" | sudo tee -a /etc/srslte/user_db.csv
+    sudo sed -i -re "s/^(ue${idx},.*)\$/#\\1/" /etc/srslte/user_db.csv
+    echo "ue${idx},mil,${imsi},${key},opc,${DEFOPC},9001,000000001234,7,${ipaddr}" | sudo tee -a /etc/srslte/user_db.csv
 done
 
 touch $OURDIR/update-enb-config-files-done
